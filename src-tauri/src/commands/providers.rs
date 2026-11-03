@@ -765,7 +765,8 @@ fn resolve_direct_credential(
         AUTH_NONE
     } else {
         AUTH_API_KEY
-    };
+    }
+    .to_string();
 
     // 1. Explicit key from Settings. This also covers a custom provider's
     //    `sidex.apikey.<id>` slot, which the Settings UI writes.
