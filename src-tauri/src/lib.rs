@@ -438,7 +438,7 @@ fn fix_macos_path() {
 pub struct PendingOpen(Mutex<Vec<PathBuf>>);
 
 impl PendingOpen {
-    fn push(&self, paths: &[PathBuf]) {
+    pub(crate) fn push(&self, paths: &[PathBuf]) {
         if paths.is_empty() {
             return;
         }
@@ -447,7 +447,7 @@ impl PendingOpen {
         }
     }
 
-    fn take(&self) -> Vec<PathBuf> {
+    pub(crate) fn take(&self) -> Vec<PathBuf> {
         match self.0.lock() {
             Ok(mut queue) => std::mem::take(&mut *queue),
             Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
@@ -495,17 +495,6 @@ fn open_paths(app: &tauri::AppHandle, paths: &[PathBuf]) {
         .collect();
     let payload = serde_json::json!({ "paths": serialized });
     let _ = app.emit("sidex://open-file", payload);
-}
-
-/// Returns the paths buffered before the webview started listening and clears
-/// the queue, so a second call reports nothing new.
-#[tauri::command]
-pub fn open_paths_take(state: tauri::State<'_, PendingOpen>) -> Vec<String> {
-    state
-        .take()
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -870,7 +859,7 @@ pub fn run() {
             commands::set_window_title,
             commands::get_monitors,
             commands::save_window_state,
-            open_paths_take,
+            commands::window::open_paths_take,
             commands::update_check,
             commands::update_download,
             commands::update_apply,

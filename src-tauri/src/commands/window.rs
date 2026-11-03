@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use super::storage::StorageDb;
+use crate::PendingOpen;
 
 #[derive(Debug, Serialize)]
 pub struct MonitorInfo {
@@ -179,4 +180,15 @@ pub fn save_window_state(
     let json = serde_json::to_string(&state).map_err(|e| e.to_string())?;
     db.set(WINDOW_STATE_KEY, &json)?;
     Ok(())
+}
+
+/// Returns the paths buffered before the webview started listening and clears
+/// the queue, so a second call reports nothing new.
+#[tauri::command]
+pub fn open_paths_take(state: tauri::State<'_, PendingOpen>) -> Vec<String> {
+    state
+        .take()
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
