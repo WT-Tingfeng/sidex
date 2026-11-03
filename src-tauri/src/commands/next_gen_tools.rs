@@ -331,16 +331,17 @@ pub async fn understand_symbol(
     let include_callers = include_callers.unwrap_or(true);
 
     // Find definition using ripgrep
-    let def_output = tokio::process::Command::new("rg")
+    let mut def_cmd = tokio::process::Command::new("rg");
+    def_cmd
         .args(["--max-count=1", "--line-number", "--no-heading", "-e"])
         .arg(format!(
             r"(fn|function|class|struct|type|interface|def|const|let|var)\s+{}\b",
             symbol
         ))
-        .arg(&search_path)
-        .output()
-        .await
-        .map_err(|e| format!("ripgrep failed: {}", e))?;
+        .arg(&search_path);
+    #[cfg(windows)]
+    def_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let def_output = def_cmd.output().await.map_err(|e| format!("ripgrep failed: {}", e))?;
 
     let def_str = String::from_utf8_lossy(&def_output.stdout);
     let definition = parse_first_match(&def_str);
@@ -349,13 +350,14 @@ pub async fn understand_symbol(
     let mut callers = Vec::new();
     let mut references = 0;
     if include_callers {
-        let ref_output = tokio::process::Command::new("rg")
+        let mut ref_cmd = tokio::process::Command::new("rg");
+        ref_cmd
             .args(["--max-count=20", "--line-number", "--no-heading", "-e"])
             .arg(format!(r"\b{}\b", symbol))
-            .arg(&search_path)
-            .output()
-            .await
-            .map_err(|e| format!("ripgrep failed: {}", e))?;
+            .arg(&search_path);
+        #[cfg(windows)]
+        ref_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let ref_output = ref_cmd.output().await.map_err(|e| format!("ripgrep failed: {}", e))?;
 
         let ref_str = String::from_utf8_lossy(&ref_output.stdout);
         for line in ref_str.lines() {
@@ -477,7 +479,8 @@ pub async fn context_search(
     let keywords: Vec<&str> = query.split_whitespace().collect();
     let pattern = keywords.join("|");
 
-    let output = tokio::process::Command::new("rg")
+    let mut search_cmd = tokio::process::Command::new("rg");
+    search_cmd
         .args([
             "--line-number",
             "--no-heading",
@@ -486,10 +489,10 @@ pub async fn context_search(
             "-e",
         ])
         .arg(&pattern)
-        .arg(&search_path)
-        .output()
-        .await
-        .map_err(|e| format!("Search failed: {}", e))?;
+        .arg(&search_path);
+    #[cfg(windows)]
+    search_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let output = search_cmd.output().await.map_err(|e| format!("Search failed: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let total_candidates = stdout.lines().count();

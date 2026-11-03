@@ -73,7 +73,81 @@
 					'Helvetica Neue', sans-serif;
 				font-size: 13px;
 			}
+
+			#sidex-splash {
+				position: fixed;
+				inset: 0;
+				z-index: 2147483647;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: center;
+				gap: 12px;
+				background-color: #111111;
+				pointer-events: none;
+				opacity: 1;
+				transition: opacity 0.3s ease-out;
+			}
+
+			#sidex-splash.sidex-splash-hiding {
+				opacity: 0;
+			}
+
+			#sidex-splash .sidex-splash-wordmark {
+				font-size: 36px;
+				font-weight: 600;
+				letter-spacing: 0.04em;
+				color: #e7e7e7;
+				-webkit-user-select: none;
+				user-select: none;
+			}
+
+			#sidex-splash .sidex-splash-wordmark span {
+				color: #4daafc;
+			}
+
+			#sidex-splash .sidex-splash-status {
+				font-size: 13px;
+				letter-spacing: 0.08em;
+				color: #8c8c8c;
+				-webkit-user-select: none;
+				user-select: none;
+			}
+
+			@media (prefers-reduced-motion: no-preference) {
+				#sidex-splash .sidex-splash-status {
+					animation: sidex-splash-pulse 1.6s ease-in-out infinite;
+				}
+			}
+
+			@keyframes sidex-splash-pulse {
+				0%,
+				100% {
+					opacity: 0.45;
+				}
+				50% {
+					opacity: 1;
+				}
+			}
 		</style>
 	</head>
-	<body aria-label=""></body>
+	<body aria-label="">
+		<!-- Startup splash. Inline and dependency-free on purpose: the HTML
+		     itself paints the dark frame, so the window never shows an empty
+		     black rectangle while the workbench bundle loads. src/main.ts
+		     fades it out once the workbench has mounted; the inline timer
+		     below removes it even if the entry module fails to load. -->
+		<div id="sidex-splash" role="presentation" aria-hidden="true">
+			<div class="sidex-splash-wordmark">Side<span>X</span></div>
+			<div class="sidex-splash-status">正在启动…</div>
+		</div>
+		<script>
+			setTimeout(function () {
+				var splash = document.getElementById('sidex-splash');
+				if (splash) {
+					splash.remove();
+				}
+			}, 15000);
+		</script>
+	</body>
 </html>

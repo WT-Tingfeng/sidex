@@ -121,6 +121,11 @@ pub fn task_spawn(
         if let Some(ref a) = args {
             c.args(a);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
         c
     };
 

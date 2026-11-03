@@ -4,6 +4,7 @@ import { InlineDiffView, DiffCallbacks } from '../diff/inlineDiffView.js';
 import { DiffHunk } from '../diff/diffAlgorithm.js';
 import { ILanguageService } from '../../../../../../editor/common/languages/language.js';
 import { IModelService } from '../../../../../../editor/common/services/model.js';
+import { t } from '../../i18n.js';
 
 const EDIT_TOOLS = new Set([
 	'edit_file', 'write_file', 'multi_edit', 'create_file',
@@ -11,27 +12,27 @@ const EDIT_TOOLS = new Set([
 ]);
 
 const TOOL_DESCRIPTIONS: Record<string, (args: Record<string, unknown>) => string> = {
-	read_file: (a) => `Read ${fileName(a['path'])}`,
-	write_file: (a) => `Wrote ${fileName(a['path'])}`,
-	edit_file: (a) => `Edited ${fileName(a['path'])}`,
-	multi_edit: (a) => `Edited ${fileName(a['path'])}`,
-	create_file: (a) => `Created ${fileName(a['path'])}`,
-	str_replace_editor: (a) => `Edited ${fileName(a['path'])}`,
-	delete_file: (a) => `Deleted ${fileName(a['path'])}`,
-	shell: (a) => `Ran \`${shortCmd(a['command'])}\``,
-	grep: (a) => `Searched for "${a['pattern'] || ''}"`,
-	glob: (a) => `Found files matching "${a['pattern'] || a['glob'] || ''}"`,
-	search_files: (a) => `Searched files for "${a['pattern'] || ''}"`,
+	read_file: (a) => `${t('Read')} ${fileName(a['path'])}`,
+	write_file: (a) => `${t('Wrote')} ${fileName(a['path'])}`,
+	edit_file: (a) => `${t('Edited')} ${fileName(a['path'])}`,
+	multi_edit: (a) => `${t('Edited')} ${fileName(a['path'])}`,
+	create_file: (a) => `${t('Created')} ${fileName(a['path'])}`,
+	str_replace_editor: (a) => `${t('Edited')} ${fileName(a['path'])}`,
+	delete_file: (a) => `${t('Deleted')} ${fileName(a['path'])}`,
+	shell: (a) => `${t('Ran')} \`${shortCmd(a['command'])}\``,
+	grep: (a) => `${t('Searched for')} "${a['pattern'] || ''}"`,
+	glob: (a) => `${t('Found files matching')} "${a['pattern'] || a['glob'] || ''}"`,
+	search_files: (a) => `${t('Searched files for')} "${a['pattern'] || ''}"`,
 	git_status: () => 'Checked git status',
 	git_log: () => 'Viewed git log',
-	git_diff_file: (a) => `Diffed ${fileName(a['path'])}`,
-	git_commit: (a) => `Committed: ${a['message'] || ''}`,
-	list_dir: (a) => `Listed ${a['path'] || '.'}`,
-	tree: (a) => `Listed tree of ${a['path'] || '.'}`,
+	git_diff_file: (a) => `${t('Diffed')} ${fileName(a['path'])}`,
+	git_commit: (a) => `${t('Committed:')} ${a['message'] || ''}`,
+	list_dir: (a) => `${t('Listed')} ${a['path'] || '.'}`,
+	tree: (a) => `${t('Listed tree of')} ${a['path'] || '.'}`,
 	batch_read: () => 'Read multiple files',
-	lsp_hover: (a) => `Inspected symbol in ${fileName(a['path'])}`,
-	lsp_definition: (a) => `Found definition in ${fileName(a['path'])}`,
-	lsp_references: (a) => `Found references in ${fileName(a['path'])}`,
+	lsp_hover: (a) => `${t('Inspected symbol in')} ${fileName(a['path'])}`,
+	lsp_definition: (a) => `${t('Found definition in')} ${fileName(a['path'])}`,
+	lsp_references: (a) => `${t('Found references in')} ${fileName(a['path'])}`,
 };
 
 function fileName(path: unknown): string {

@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,11 +309,15 @@ pub fn resolve_builtin_extensions_dir(app: &AppHandle) -> PathBuf {
 }
 
 fn read_node_version(binary: &str) -> Option<String> {
-    Command::new(binary)
-        .arg("--version")
+    let mut cmd = Command::new(binary);
+    cmd.arg("--version")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    cmd.output()
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|v| v.trim().to_string())
@@ -318,12 +325,15 @@ fn read_node_version(binary: &str) -> Option<String> {
 }
 
 fn is_usable_node(binary: &str) -> bool {
-    Command::new(binary)
-        .arg("--version")
+    let mut cmd = Command::new(binary);
+    cmd.arg("--version")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    cmd.status().is_ok()
 }
 
 pub fn bundled_node_candidates(app: &AppHandle) -> Vec<PathBuf> {

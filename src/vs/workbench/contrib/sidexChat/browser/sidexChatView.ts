@@ -34,6 +34,7 @@ import { SidexOrchestrator, OrchestrationView, StreamConsumer } from './orchestr
 import { IAccountService } from './account/accountService.js';
 import { AccountPanel } from './account/accountPanel.js';
 import { serverWsUrl } from './localServer.js';
+import { observeI18n, t } from './i18n.js';
 
 const $ = DOM.$;
 
@@ -131,6 +132,10 @@ export class SidexChatViewPane extends ViewPane {
 		this._bindScrollDetection();
 		this._bindEvents();
 		this.chatService.connect();
+
+		// SideX-added UI is hardcoded English; translate it (and keep translating
+		// dynamically rendered content) while VS Code core stays on the language pack.
+		this._viewDisposables.add(observeI18n(parent));
 
 		// Fetch autoScroll setting from settings
 		const tInvoke = (globalThis as any).__TAURI_INTERNALS__?.invoke;
@@ -779,10 +784,10 @@ export class SidexChatViewPane extends ViewPane {
 		const title = document.createElement('span');
 		title.className = 'sc-error-banner-title';
 		title.textContent = text.includes('usage cap') || text.includes('Anthropic returned 429')
-			? 'Claude usage limit'
+			? t('Claude usage limit')
 			: text.includes('Anthropic blocked') || text.includes('Anthropic refused')
-				? 'Anthropic blocked this login'
-				: 'Unable to reach model';
+				? t('Anthropic blocked this login')
+				: t('Unable to reach model');
 		row1.appendChild(title);
 		banner.appendChild(row1);
 
@@ -803,12 +808,12 @@ export class SidexChatViewPane extends ViewPane {
 		row3.className = 'sc-error-banner-row3';
 		const idEl = document.createElement('span');
 		idEl.className = 'sc-error-banner-id';
-		idEl.textContent = `Request (${requestId.slice(0, 8)})`;
+		idEl.textContent = t(`Request (${requestId.slice(0, 8)})`);
 		row3.appendChild(idEl);
 
 		const retryBtn = document.createElement('button');
 		retryBtn.className = 'sc-error-banner-retry';
-		retryBtn.textContent = 'Try again';
+		retryBtn.textContent = t('Try again');
 		retryBtn.addEventListener('click', () => {
 			banner.remove();
 			// Retry: just call sendMessage with the last user text.

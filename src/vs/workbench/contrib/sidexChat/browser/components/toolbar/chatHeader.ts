@@ -3,6 +3,7 @@ import { Emitter, Event } from '../../../../../../base/common/event.js';
 import { Codicon } from '../../../../../../base/common/codicons.js';
 import { ThemeIcon } from '../../../../../../base/common/themables.js';
 import { IAccountService } from '../../account/accountService.js';
+import { t } from '../../i18n.js';
 
 function icon(codicon: ThemeIcon): HTMLSpanElement {
 	const el = document.createElement('span');
@@ -65,7 +66,7 @@ export class ChatHeader extends Component {
 
 		// + New Chat (left side)
 		const newBtn = this.append('button', 'sc-header-btn');
-		newBtn.title = 'New Chat';
+		newBtn.title = t('New Chat');
 		newBtn.appendChild(icon(Codicon.add));
 		this.on(newBtn, 'click', () => this._onNewChat.fire());
 
@@ -73,7 +74,7 @@ export class ChatHeader extends Component {
 		this._searchBar = this.append('div', 'sc-header-search');
 		this._searchInput = DOM.append(this._searchBar, $('input.sc-header-search-input')) as HTMLInputElement;
 		this._searchInput.type = 'text';
-		this._searchInput.placeholder = 'Search chats...';
+		this._searchInput.placeholder = t('Search chats...');
 
 		// History dropdown panel (child of search bar for positioning)
 		this._historyPanel = DOM.append(this._searchBar, $('div.sc-history-panel'));
@@ -96,7 +97,7 @@ export class ChatHeader extends Component {
 			const row = DOM.append(this._itemContextMenu, $('div.sc-context-item'));
 			row.appendChild(icon(action.codicon));
 			const label = DOM.append(row, $('span'));
-			label.textContent = action.label;
+			label.textContent = t(action.label);
 			row.dataset.action = action.id;
 		}
 		this.on(this._itemContextMenu, 'click', (e) => {
@@ -139,7 +140,7 @@ export class ChatHeader extends Component {
 
 		// ... Menu (right side)
 		this._menuBtn = this.append('button', 'sc-header-btn');
-		this._menuBtn.title = 'More';
+		this._menuBtn.title = t('More');
 		this._menuBtn.appendChild(icon(Codicon.ellipsis));
 		this.on(this._menuBtn, 'click', () => this._toggleMenu());
 
@@ -165,7 +166,7 @@ export class ChatHeader extends Component {
 			}
 			row.appendChild(icon(item.codicon));
 			const label = DOM.append(row, $('span'));
-			label.textContent = item.label;
+			label.textContent = t(item.label);
 			
 			if (item.disabled) {
 				// Prevent clicking disabled coming-soon items
@@ -182,11 +183,11 @@ export class ChatHeader extends Component {
 		// Bottom MCP status bar (Cursor/Windsurf style)
 		const mcpBar = DOM.append(this._menuPanel, $('div.sc-menu-mcp-bar'));
 		const mcpLeft = DOM.append(mcpBar, $('div.sc-menu-mcp-left'));
-		mcpLeft.textContent = '0 MCPs';
+		mcpLeft.textContent = t('0 MCPs');
 
 		const mcpRight = DOM.append(mcpBar, $('div.sc-menu-mcp-right'));
 		const gearBtn = DOM.append(mcpRight, $('button.sc-menu-mcp-btn'));
-		gearBtn.title = 'Configure MCP Servers';
+		gearBtn.title = t('Configure MCP Servers');
 		gearBtn.appendChild(icon(Codicon.settingsGear));
 		this.on(gearBtn, 'click', (e) => {
 			e.stopPropagation();
@@ -201,7 +202,7 @@ export class ChatHeader extends Component {
 			if (invoke) {
 				invoke('mcp_list_servers').then((servers: any) => {
 					const count = Array.isArray(servers) ? servers.length : typeof servers === 'object' && servers ? Object.keys(servers).length : 0;
-					mcpLeft.textContent = `${count} MCPs`;
+					mcpLeft.textContent = t(`${count} MCPs`);
 				}).catch(() => {});
 			}
 		} catch { /* ignore */ }
@@ -234,7 +235,7 @@ export class ChatHeader extends Component {
 		DOM.clearNode(this._historyList);
 		if (sessions.length === 0) {
 			const empty = DOM.append(this._historyList, $('div.sc-history-empty'));
-			empty.textContent = 'No past chats';
+			empty.textContent = t('No past chats');
 			return;
 		}
 		for (const s of sessions) {
@@ -242,7 +243,7 @@ export class ChatHeader extends Component {
 			row.dataset.id = s.id;
 			row.dataset.title = (s.title || '').toLowerCase();
 			const titleEl = DOM.append(row, $('span.sc-history-title'));
-			titleEl.textContent = s.title || 'Untitled';
+			titleEl.textContent = s.title || t('Untitled');
 			if (s.updated_at) {
 				const dateEl = DOM.append(row, $('span.sc-history-date'));
 				dateEl.textContent = new Date(s.updated_at).toLocaleDateString();
@@ -250,14 +251,14 @@ export class ChatHeader extends Component {
 
 			const actions = DOM.append(row, $('div.sc-history-actions'));
 			const moreBtn = DOM.append(actions, $('button.sc-history-action-btn'));
-			moreBtn.title = 'More';
+			moreBtn.title = t('More');
 			moreBtn.appendChild(icon(Codicon.ellipsis));
 			const pinBtn = DOM.append(actions, $('button.sc-history-action-btn'));
-			pinBtn.title = 'Pin';
+			pinBtn.title = t('Pin');
 			pinBtn.appendChild(icon(Codicon.pin));
 			if (s.pinned) { pinBtn.classList.add('active'); }
 			const archiveBtn = DOM.append(actions, $('button.sc-history-action-btn'));
-			archiveBtn.title = 'Archive';
+			archiveBtn.title = t('Archive');
 			archiveBtn.appendChild(icon(Codicon.archive));
 
 			this.on(pinBtn, 'click', (e) => {

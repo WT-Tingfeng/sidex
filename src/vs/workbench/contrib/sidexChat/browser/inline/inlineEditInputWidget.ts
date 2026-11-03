@@ -8,6 +8,7 @@ import { ICodeEditor, IContentWidget, IContentWidgetPosition, ContentWidgetPosit
 import { Emitter, Event } from '../../../../../base/common/event.js';
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import * as DOM from '../../../../../base/browser/dom.js';
+import { t } from '../i18n.js';
 
 export class InlineEditInputWidget extends Disposable implements IContentWidget {
 	private static _idCounter = 0;
@@ -42,13 +43,13 @@ export class InlineEditInputWidget extends Disposable implements IContentWidget 
 
 		const label = document.createElement('span');
 		label.className = 'sidex-inline-edit-label';
-		label.textContent = 'Edit';
+		label.textContent = t('Edit');
 		row.appendChild(label);
 
 		this._input = document.createElement('input');
 		this._input.className = 'sidex-inline-edit-input';
 		this._input.type = 'text';
-		this._input.placeholder = 'Describe the change...';
+		this._input.placeholder = t('Describe the change...');
 		this._input.setAttribute('autocomplete', 'off');
 		this._input.setAttribute('autocorrect', 'off');
 		this._input.setAttribute('spellcheck', 'false');
@@ -56,7 +57,7 @@ export class InlineEditInputWidget extends Disposable implements IContentWidget 
 
 		const hint = document.createElement('span');
 		hint.className = 'sidex-inline-edit-hint';
-		hint.textContent = 'Enter';
+		hint.textContent = t('Enter');
 		row.appendChild(hint);
 
 		this._domNode.appendChild(row);
@@ -126,10 +127,10 @@ export class InlineEditInputWidget extends Disposable implements IContentWidget 
 	setLoading(loading: boolean): void {
 		this._input.disabled = loading;
 		if (loading) {
-			this._input.placeholder = 'Generating edit...';
+			this._input.placeholder = t('Generating edit...');
 			this._domNode.classList.add('loading');
 		} else {
-			this._input.placeholder = 'Describe the change...';
+			this._input.placeholder = t('Describe the change...');
 			this._domNode.classList.remove('loading');
 		}
 	}

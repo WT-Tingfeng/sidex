@@ -14,6 +14,7 @@ import { RulesSection } from './sections/rulesSection.js';
 import { ToolsSection } from './sections/toolsSection.js';
 import { IndexingSection } from './sections/indexingSection.js';
 import { ConfigurationSection } from './sections/configurationSection.js';
+import { observeI18n } from '../i18n.js';
 
 export interface NavItem {
 	type?: 'separator';
@@ -75,6 +76,9 @@ export class SidexSettingsPanel extends Disposable {
 		ensureSettingsStyles();
 		this._buildDOM();
 		this._bindEvents();
+
+		// Localize the SideX settings modal (nav, sections, dialogs reachable from chat).
+		this._disposables.add(observeI18n(this._overlay));
 	}
 
 	private _getTauriInvoke(): ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null {

@@ -22,12 +22,13 @@ import { ServicesAccessor } from '../../../../platform/instantiation/common/inst
 import { IWorkbenchLayoutService, Parts } from '../../../services/layout/browser/layoutService.js';
 import { IStatusbarService, StatusbarAlignment } from '../../../services/statusbar/browser/statusbar.js';
 import { SidexChatViewPane } from './sidexChatView.js';
+import { t } from './i18n.js';
 import './sidexChatService.js';
 
 export const SIDEX_CHAT_CONTAINER_ID = 'workbench.view.sidexChat';
 export const SIDEX_CHAT_VIEW_ID = 'workbench.view.sidexChat.main';
 
-const sidexChatIcon = registerIcon('sidex-chat-icon', Codicon.commentDiscussion, nls.localize('sidexChatIcon', 'Sidex icon'));
+const sidexChatIcon = registerIcon('sidex-chat-icon', Codicon.commentDiscussion, nls.localize('sidexChatIcon', t('Sidex icon')));
 
 const viewContainer = Registry.as<IViewContainersRegistry>(ViewExtensions.ViewContainersRegistry).registerViewContainer(
 	{
@@ -62,7 +63,7 @@ registerAction2(class extends Action2 {
 	constructor() {
 		super({
 			id: 'workbench.action.toggleSidexChat',
-			title: nls.localize2('toggleSidex', 'Toggle Sidex'),
+			title: nls.localize2('toggleSidex', t('Toggle Sidex')),
 			keybinding: {
 				primary: KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyI,
 				weight: KeybindingWeight.WorkbenchContrib,
@@ -81,7 +82,7 @@ registerAction2(class extends Action2 {
 	constructor() {
 		super({
 			id: 'workbench.action.sidexStatusBarToggle',
-			title: nls.localize2('sidexStatusBarToggle', 'Toggle Sidex'),
+			title: nls.localize2('sidexStatusBarToggle', t('Toggle Sidex')),
 		});
 	}
 	async run(accessor: ServicesAccessor): Promise<void> {
@@ -112,7 +113,7 @@ class SidexStatusBarContribution implements IWorkbenchContribution {
 			{
 				name: nls.localize('sidexToggle', 'Sidex'),
 				text: this._sidexIcon(),
-				ariaLabel: nls.localize('toggleSidex', 'Toggle Sidex'),
+				ariaLabel: nls.localize('toggleSidex', t('Toggle Sidex')),
 				command: 'workbench.action.sidexStatusBarToggle',
 				tooltip: this._sidexTooltip(),
 			},
@@ -124,9 +125,9 @@ class SidexStatusBarContribution implements IWorkbenchContribution {
 		// Secondary sidebar toggle (next to Sidex, for Claude Code etc.)
 		const auxEntry = statusbarService.addEntry(
 			{
-				name: nls.localize('auxToggle', 'Secondary Sidebar'),
+				name: nls.localize('auxToggle', t('Secondary Sidebar')),
 				text: this._auxIcon(),
-				ariaLabel: nls.localize('toggleAux', 'Toggle Secondary Sidebar'),
+				ariaLabel: nls.localize('toggleAux', t('Toggle Secondary Sidebar')),
 				command: 'workbench.action.toggleAuxiliaryBar',
 				tooltip: this._auxTooltip(),
 			},
@@ -140,14 +141,14 @@ class SidexStatusBarContribution implements IWorkbenchContribution {
 			sidexEntry.update({
 				name: nls.localize('sidexToggle', 'Sidex'),
 				text: this._sidexIcon(),
-				ariaLabel: nls.localize('toggleSidex', 'Toggle Sidex'),
+				ariaLabel: nls.localize('toggleSidex', t('Toggle Sidex')),
 				command: 'workbench.action.sidexStatusBarToggle',
 				tooltip: this._sidexTooltip(),
 			});
 			auxEntry.update({
-				name: nls.localize('auxToggle', 'Secondary Sidebar'),
+				name: nls.localize('auxToggle', t('Secondary Sidebar')),
 				text: this._auxIcon(),
-				ariaLabel: nls.localize('toggleAux', 'Toggle Secondary Sidebar'),
+				ariaLabel: nls.localize('toggleAux', t('Toggle Secondary Sidebar')),
 				command: 'workbench.action.toggleAuxiliaryBar',
 				tooltip: this._auxTooltip(),
 			});
@@ -167,7 +168,7 @@ class SidexStatusBarContribution implements IWorkbenchContribution {
 	}
 
 	private _sidexTooltip(): string {
-		return this.layoutService.isVisible(Parts.SIDEX_PART) ? 'Hide Sidex' : 'Show Sidex';
+		return t(this.layoutService.isVisible(Parts.SIDEX_PART) ? 'Hide Sidex' : 'Show Sidex');
 	}
 
 	private _auxIcon(): string {
@@ -177,7 +178,7 @@ class SidexStatusBarContribution implements IWorkbenchContribution {
 	}
 
 	private _auxTooltip(): string {
-		return this.layoutService.isVisible(Parts.AUXILIARYBAR_PART) ? 'Hide Secondary Sidebar' : 'Show Secondary Sidebar';
+		return t(this.layoutService.isVisible(Parts.AUXILIARYBAR_PART) ? 'Hide Secondary Sidebar' : 'Show Secondary Sidebar');
 	}
 }
 
@@ -198,7 +199,7 @@ registerAction2(class extends Action2 {
 	constructor() {
 		super({
 			id: 'sidex.inlineEdit.activate',
-			title: nls.localize2('sidexInlineEdit', 'Sidex: Inline Edit'),
+			title: nls.localize2('sidexInlineEdit', t('Sidex: Inline Edit')),
 			keybinding: {
 				primary: KeyMod.CtrlCmd | KeyCode.KeyK,
 				weight: KeybindingWeight.EditorContrib + 100,

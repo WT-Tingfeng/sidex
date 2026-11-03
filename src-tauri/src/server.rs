@@ -360,6 +360,15 @@ fn spawn_and_confirm(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
+    // The server is a console-mode executable; without this Windows opens a
+    // console window for it, which flashes at app start and closing it kills
+    // the child. Keep the console hidden.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
@@ -599,10 +608,11 @@ mod tests {
     }
     #[cfg(windows)]
     fn spawn_short_lived() -> Child {
-        Command::new("cmd")
-            .args(["/C", "exit", "0"])
-            .spawn()
-            .expect("spawn `cmd /C exit 0`")
+        use std::os::windows::process::CommandExt;
+
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "exit", "0"]).creation_flags(0x0800_0000);
+        cmd.spawn().expect("spawn `cmd /C exit 0`")
     }
 
     #[cfg(unix)]
@@ -614,10 +624,11 @@ mod tests {
     }
     #[cfg(windows)]
     fn spawn_long_lived() -> Child {
-        Command::new("ping")
-            .args(["-n", "6", "127.0.0.1"])
-            .spawn()
-            .expect("spawn `ping`")
+        use std::os::windows::process::CommandExt;
+
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "6", "127.0.0.1"]).creation_flags(0x0800_0000);
+        cmd.spawn().expect("spawn `ping`")
     }
 
     /// Restarting must not move the server.

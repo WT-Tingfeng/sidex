@@ -5,6 +5,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Component, DOM, $ } from './base.js';
+import { translateDom } from '../i18n.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
 
 export interface IConfirmDialogOptions {
@@ -97,6 +98,9 @@ export class ConfirmDialog extends Component {
 				this._trapTab(ke);
 			}
 		});
+
+		// The dialog mounts on the workbench host, outside the chat view's observer.
+		translateDom(this.element);
 	}
 
 	/** Focuses the confirm button; call once the element is attached so focus() actually takes. */
@@ -156,7 +160,7 @@ export function showConfirmDialog(options: IConfirmDialogOptions): Promise<boole
 		// Theme color tokens live on `.monaco-workbench`, not on `body`.
 		// Mounting on body leaves `--vscode-editorWidget-background` unset, so
 		// the card paints transparent and settings text shows through.
-		const host = document.querySelector('.monaco-workbench') ?? document.body;
+		const host = (document.querySelector('.monaco-workbench') as HTMLElement | null) ?? document.body;
 		dialog.appendTo(host);
 		// Deferred a frame so the element has layout before it (or anything in it) can take focus.
 		requestAnimationFrame(() => dialog.focusDefault());

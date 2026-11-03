@@ -57,6 +57,7 @@ import { IInstantiationService, ServicesAccessor } from '../../../../platform/in
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
 import { IAccountService } from '../../../contrib/sidexChat/browser/account/accountService.js';
+import { t } from '../../../contrib/sidexChat/browser/i18n.js';
 import { IUpdateService } from '../../../../platform/update/common/update.js';
 import { URI } from '../../../../base/common/uri.js';
 import {
@@ -654,13 +655,13 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 				document.body.appendChild(popup);
 
 				const items = [
-					{ icon: 'codicon-folder-opened', label: 'Open Folder...', cmd: 'workbench.action.files.openFolder' },
-					{ icon: 'codicon-source-control', label: 'Clone Repository...', cmd: 'git.clone' },
+					{ icon: 'codicon-folder-opened', label: t('Open Folder...'), cmd: 'workbench.action.files.openFolder' },
+					{ icon: 'codicon-source-control', label: t('Clone Repository...'), cmd: 'git.clone' },
 					{ separator: true },
-					{ icon: 'codicon-window', label: 'Recent Projects...', cmd: 'workbench.action.openRecent' },
+					{ icon: 'codicon-window', label: t('Recent Projects...'), cmd: 'workbench.action.openRecent' },
 					{ separator: true },
-					{ icon: 'codicon-empty-window', label: 'New Window', cmd: 'workbench.action.newWindow' },
-					{ icon: 'codicon-close', label: 'Close Folder', cmd: 'workbench.action.closeFolder' },
+					{ icon: 'codicon-empty-window', label: t('New Window'), cmd: 'workbench.action.newWindow' },
+					{ icon: 'codicon-close', label: t('Close Folder'), cmd: 'workbench.action.closeFolder' },
 				];
 
 				const cleanup = () => { popup.remove(); backdrop.remove(); };
@@ -702,7 +703,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 			centerSearchIcon.setAttribute('aria-hidden', 'true');
 			this.breadcrumbsElement = append(centerBar, $('div.sidex-breadcrumbs'));
 			const centerPlaceholder = append(centerBar, $('span.sidex-center-placeholder'));
-			centerPlaceholder.textContent = 'Search...';
+			centerPlaceholder.textContent = t('Search...');
 			this.updateBreadcrumbs();
 
 			this._register(addDisposableListener(centerBar, EventType.CLICK, () => {
@@ -799,27 +800,27 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 						SidexSettingsPanel.getInstance().toggle();
 					}).catch(() => { /* panel is optional */ });
 				};
-				actions.push(toAction({ id: 'sidex.profile.settings', label: 'SideX Settings', run: openSidexSettings }));
-				actions.push(toAction({ id: 'sidex.profile.usage', label: 'SideX Usage', run: openSidexSettings }));
+				actions.push(toAction({ id: 'sidex.profile.settings', label: t('SideX Settings'), run: openSidexSettings }));
+				actions.push(toAction({ id: 'sidex.profile.usage', label: t('SideX Usage'), run: openSidexSettings }));
 
 				actions.push(new Separator());
 
 				// Group 2: Editor Settings
-				actions.push(toAction({ id: 'sidex.manage.settings', label: 'Editor Settings', run: () => this.commandService.executeCommand('workbench.action.openSettings') }));
-				actions.push(toAction({ id: 'sidex.manage.commandPalette', label: 'Command Palette...', run: () => this.commandService.executeCommand('workbench.action.showCommands') }));
-				actions.push(toAction({ id: 'sidex.manage.keybindings', label: 'Open Keyboard Shortcuts [⌘K ⌘S]', run: () => this.commandService.executeCommand('workbench.action.openGlobalKeybindings') }));
-				actions.push(toAction({ id: 'sidex.manage.extensions', label: 'Extensions', run: () => this.commandService.executeCommand('workbench.view.extensions') }));
-				actions.push(toAction({ id: 'sidex.manage.snippets', label: 'Configure Snippets', run: () => this.commandService.executeCommand('workbench.action.openSnippets') }));
-				actions.push(toAction({ id: 'sidex.manage.tasks', label: 'Tasks', run: () => this.commandService.executeCommand('workbench.action.tasks.runTask') }));
-				actions.push(toAction({ id: 'sidex.manage.themes', label: 'Themes', run: () => this.commandService.executeCommand('workbench.action.selectTheme') }));
+				actions.push(toAction({ id: 'sidex.manage.settings', label: t('Editor Settings'), run: () => this.commandService.executeCommand('workbench.action.openSettings') }));
+				actions.push(toAction({ id: 'sidex.manage.commandPalette', label: t('Command Palette...'), run: () => this.commandService.executeCommand('workbench.action.showCommands') }));
+				actions.push(toAction({ id: 'sidex.manage.keybindings', label: t('Open Keyboard Shortcuts [⌘K ⌘S]'), run: () => this.commandService.executeCommand('workbench.action.openGlobalKeybindings') }));
+				actions.push(toAction({ id: 'sidex.manage.extensions', label: t('Extensions'), run: () => this.commandService.executeCommand('workbench.view.extensions') }));
+				actions.push(toAction({ id: 'sidex.manage.snippets', label: t('Configure Snippets'), run: () => this.commandService.executeCommand('workbench.action.openSnippets') }));
+				actions.push(toAction({ id: 'sidex.manage.tasks', label: t('Tasks'), run: () => this.commandService.executeCommand('workbench.action.tasks.runTask') }));
+				actions.push(toAction({ id: 'sidex.manage.themes', label: t('Themes'), run: () => this.commandService.executeCommand('workbench.action.selectTheme') }));
 
 				actions.push(new Separator());
 
 				// Group 3: Help / Info
-				actions.push(toAction({ id: 'sidex.manage.updates', label: 'Check for Updates...', run: () => this.updateService.checkForUpdates(true) }));
+				actions.push(toAction({ id: 'sidex.manage.updates', label: t('Check for Updates...'), run: () => this.updateService.checkForUpdates(true) }));
 				// docs.sidex.dev does not resolve; the README is the actual docs entry point until a docs site exists.
-				actions.push(toAction({ id: 'sidex.manage.docs', label: 'Docs', run: () => this.commandService.executeCommand('vscode.open', URI.parse('https://github.com/Sidenai/sidex#readme')) }));
-				actions.push(toAction({ id: 'sidex.manage.community', label: 'Join the Community', run: () => this.commandService.executeCommand('vscode.open', URI.parse('https://discord.gg/8CUCnEAC4J')) }));
+				actions.push(toAction({ id: 'sidex.manage.docs', label: t('Docs'), run: () => this.commandService.executeCommand('vscode.open', URI.parse('https://github.com/Sidenai/sidex#readme')) }));
+				actions.push(toAction({ id: 'sidex.manage.community', label: t('Join the Community'), run: () => this.commandService.executeCommand('vscode.open', URI.parse('https://discord.gg/8CUCnEAC4J')) }));
 
 				this.contextMenuService.showContextMenu({
 					getAnchor: () => profileButton,
@@ -1114,7 +1115,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 		const searchInput = document.createElement('input');
 		searchInput.type = 'text';
 		searchInput.className = 'sidex-popup-search';
-		searchInput.placeholder = 'Filter branches, stashes, tags...';
+		searchInput.placeholder = t('Filter branches, stashes, tags...');
 		searchRow.appendChild(searchInput);
 		popup.appendChild(searchRow);
 
@@ -1156,7 +1157,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 		};
 
 		const renderContent = async () => {
-			contentArea.innerHTML = '<div class="sidex-popup-loading">Loading...</div>';
+			contentArea.innerHTML = `<div class="sidex-popup-loading">${t('Loading...')}</div>`;
 
 			try {
 				const repo = getRepo();
@@ -1308,7 +1309,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 				if (localBranches.length > 0) {
 					const header = document.createElement('div');
 					header.className = 'sidex-popup-header';
-					header.textContent = `Local Branches`;
+					header.textContent = t('Local Branches');
 					contentArea.appendChild(header);
 
 					for (const branch of localBranches) {
@@ -1323,7 +1324,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 				if (remoteBranches.length > 0) {
 					const header = document.createElement('div');
 					header.className = 'sidex-popup-header';
-					header.textContent = `Remote Branches`;
+					header.textContent = t('Remote Branches');
 					contentArea.appendChild(header);
 
 					for (const branch of remoteBranches) {
@@ -1338,7 +1339,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 				if (tags.length > 0) {
 					const header = document.createElement('div');
 					header.className = 'sidex-popup-header';
-					header.textContent = 'Tags';
+					header.textContent = t('Tags');
 					contentArea.appendChild(header);
 
 					for (const tag of tags) {
@@ -1364,7 +1365,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 				if (stashes.length > 0) {
 					const header = document.createElement('div');
 					header.className = 'sidex-popup-header';
-					header.textContent = 'Stashes';
+					header.textContent = t('Stashes');
 					contentArea.appendChild(header);
 
 					for (const stash of stashes) {
@@ -1423,21 +1424,21 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 		};
 
 		const actions = [
-			{ icon: 'codicon-add', label: 'New Branch...', action: () => execCmd('git.branch') },
-			{ icon: 'codicon-git-branch', label: 'Rename Branch...', action: () => execCmd('git.renameBranch') },
-			{ icon: 'codicon-trash', label: 'Delete Branch...', action: () => execCmd('git.deleteBranch') },
+			{ icon: 'codicon-add', label: t('New Branch...'), action: () => execCmd('git.branch') },
+			{ icon: 'codicon-git-branch', label: t('Rename Branch...'), action: () => execCmd('git.renameBranch') },
+			{ icon: 'codicon-trash', label: t('Delete Branch...'), action: () => execCmd('git.deleteBranch') },
 			{ separator: true },
-			{ icon: 'codicon-cloud-download', label: 'Fetch All Remotes', action: () => execCmd('git.fetchAll') },
-			{ icon: 'codicon-arrow-down', label: 'Pull', action: () => execCmd('git.pull') },
-			{ icon: 'codicon-arrow-up', label: 'Push', action: () => execCmd('git.push') },
+			{ icon: 'codicon-cloud-download', label: t('Fetch All Remotes'), action: () => execCmd('git.fetchAll') },
+			{ icon: 'codicon-arrow-down', label: t('Pull'), action: () => execCmd('git.pull') },
+			{ icon: 'codicon-arrow-up', label: t('Push'), action: () => execCmd('git.push') },
 			{ separator: true },
-			{ icon: 'codicon-git-commit', label: 'Commit...', action: () => { cleanup(); setTimeout(() => { this.commandService.executeCommand('workbench.view.scm').then(() => { setTimeout(() => this.commandService.executeCommand('git.commit'), 150); }); }, 50); } },
-			{ icon: 'codicon-merge', label: 'Merge Branch...', action: () => execCmd('git.merge') },
-			{ icon: 'codicon-git-pull-request', label: 'Rebase...', action: () => execCmd('git.rebase') },
+			{ icon: 'codicon-git-commit', label: t('Commit...'), action: () => { cleanup(); setTimeout(() => { this.commandService.executeCommand('workbench.view.scm').then(() => { setTimeout(() => this.commandService.executeCommand('git.commit'), 150); }); }, 50); } },
+			{ icon: 'codicon-merge', label: t('Merge Branch...'), action: () => execCmd('git.merge') },
+			{ icon: 'codicon-git-pull-request', label: t('Rebase...'), action: () => execCmd('git.rebase') },
 			{ separator: true },
-			{ icon: 'codicon-archive', label: 'Stash Changes...', action: () => execCmd('git.stash') },
-			{ icon: 'codicon-archive', label: 'Pop Stash...', action: () => execCmd('git.stashPop') },
-			{ icon: 'codicon-archive', label: 'Apply Stash...', action: () => execCmd('git.stashApply') },
+			{ icon: 'codicon-archive', label: t('Stash Changes...'), action: () => execCmd('git.stash') },
+			{ icon: 'codicon-archive', label: t('Pop Stash...'), action: () => execCmd('git.stashPop') },
+			{ icon: 'codicon-archive', label: t('Apply Stash...'), action: () => execCmd('git.stashApply') },
 		];
 
 		const sep = document.createElement('div');

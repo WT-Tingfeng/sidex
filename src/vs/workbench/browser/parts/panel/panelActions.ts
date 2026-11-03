@@ -5,6 +5,7 @@
 
 import './media/panelpart.css';
 import { localize, localize2 } from '../../../../nls.js';
+import { t } from '../../../contrib/sidexChat/browser/i18n.js';
 import { KeyMod, KeyCode } from '../../../../base/common/keyCodes.js';
 import {
 	MenuId,
@@ -537,7 +538,7 @@ class MoveSidePanelToPanelAction extends MoveViewsBetweenPanelsAction {
 	constructor() {
 		super(ViewContainerLocation.AuxiliaryBar, ViewContainerLocation.Panel, {
 			id: MoveSidePanelToPanelAction.ID,
-			title: localize2('moveSidePanelToPanel', 'Move Sidex Views To Panel'),
+			title: localize2('moveSidePanelToPanel', t('Move Sidex Views To Panel')),
 			category: Categories.View,
 			f1: false
 		});
@@ -550,7 +551,7 @@ export class MoveSecondarySideBarToPanelAction extends MoveViewsBetweenPanelsAct
 	constructor() {
 		super(ViewContainerLocation.AuxiliaryBar, ViewContainerLocation.Panel, {
 			id: MoveSecondarySideBarToPanelAction.ID,
-			title: localize2('moveSidePanelToPanel', 'Move Sidex Views To Panel'),
+			title: localize2('moveSidePanelToPanel', t('Move Sidex Views To Panel')),
 			category: Categories.View,
 			f1: true
 		});

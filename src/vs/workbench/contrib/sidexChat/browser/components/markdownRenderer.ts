@@ -40,7 +40,7 @@ export function renderMarkdown(text: string): string {
 			const filepath = citationMatch[3];
 			const codeBody = citationMatch[4].trimEnd();
 			return `<div class="sc-code-citation" data-file="${escapeAttr(filepath)}" data-start-line="${startLine}" data-end-line="${endLine}">` +
-				`<div class="sc-citation-header" title="Open ${escapeAttr(filepath)}">` +
+				`<div class="sc-citation-header" title="打开 ${escapeAttr(filepath)}">` +
 				`<span class="sc-citation-icon">📄</span> ` +
 				`<span class="sc-citation-path">${escapeHtml(filepath)}</span>` +
 				`<span class="sc-citation-lines">:${startLine}-${endLine}</span>` +

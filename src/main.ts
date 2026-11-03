@@ -5,6 +5,65 @@
 
 import { loadNlsMessages } from './nls-loader.js';
 
+const SPLASH_ID = 'sidex-splash';
+const SPLASH_FADE_MS = 300;
+const SPLASH_SAFETY_TIMEOUT_MS = 15_000;
+
+let splashRemoved = false;
+
+/**
+ * Fade out the inline startup splash (index.html) and drop it from the DOM.
+ * Idempotent: safe to call from the ready path, the failure path and the
+ * safety timeout below.
+ */
+function removeSplash() {
+	if (splashRemoved) {
+		return;
+	}
+	splashRemoved = true;
+
+	const splash = document.getElementById(SPLASH_ID);
+	if (!splash) {
+		return;
+	}
+
+	splash.classList.add('sidex-splash-hiding');
+	window.setTimeout(() => splash.remove(), SPLASH_FADE_MS + 100);
+}
+
+/**
+ * Show the native window once the splash has had a chance to paint. The window
+ * is configured `visible: false`, so this is what puts it on screen; failures
+ * (e.g. a missing capability) are non-fatal because the Rust setup also shows
+ * the window.
+ */
+function showNativeWindowAfterFirstPaint() {
+	requestAnimationFrame(() => {
+		import('@tauri-apps/api/window').then(({ getCurrentWindow }) => getCurrentWindow().show()).catch(() => {});
+	});
+}
+
+/**
+ * Resolve once `create()` has mounted the workbench root (`.monaco-workbench`).
+ * `create()` returns synchronously and the workbench is appended by its async
+ * startup, so observe the DOM instead of awaiting the call.
+ */
+function whenWorkbenchMounted(): Promise<void> {
+	if (document.querySelector('.monaco-workbench')) {
+		return Promise.resolve();
+	}
+
+	return new Promise<void>(resolve => {
+		const observer = new MutationObserver(() => {
+			if (document.querySelector('.monaco-workbench')) {
+				observer.disconnect();
+				resolve();
+			}
+		});
+		observer.observe(document.body, { childList: true, subtree: true });
+	});
+}
+
 async function sidexOpenFolder() {
 	try {
 		const { open } = await import('@tauri-apps/plugin-dialog');
@@ -26,6 +85,11 @@ function navigateToFolder(folderUri: string) {
 }
 
 async function boot() {
+	// The splash is already painted by index.html; show the native window as
+	// soon as possible and never let the splash outlive startup.
+	showNativeWindowAfterFirstPaint();
+	window.setTimeout(removeSplash, SPLASH_SAFETY_TIMEOUT_MS);
+
 	// Load locale translations before any VS Code module imports
 	await loadNlsMessages();
 
@@ -211,6 +275,16 @@ async function boot() {
 	} else {
 		create(document.body, options);
 	}
+
+	// Drop the splash once the workbench root is mounted, one animation frame
+	// later so the first workbench frame is painted before it fades out.
+	whenWorkbenchMounted()
+		.then(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())))
+		.then(removeSplash)
+		.catch(err => {
+			console.error('[SideX] Waiting for workbench mount failed:', err);
+			removeSplash();
+		});
 
 	setupTauriExternalOpener();
 	setupMenuActions();

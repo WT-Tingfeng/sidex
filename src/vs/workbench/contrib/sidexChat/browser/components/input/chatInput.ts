@@ -7,6 +7,7 @@ import { MentionPopup } from './mentionPopup.js';
 import { MentionResolver, MentionItem } from '../../context/mentionResolver.js';
 import { URI } from '../../../../../../base/common/uri.js';
 import { ISidexChatService } from '../../sidexChatService.js';
+import { t } from '../../i18n.js';
 
 export type AgentMode = 'agent' | 'plan' | 'ask';
 
@@ -486,7 +487,7 @@ export class ChatInput extends Component {
 		this._attachmentsContainer = DOM.append(container, $('div.sc-attachment-pills'));
 
 		this._textareaEl = DOM.append(container, $('textarea.sc-textarea')) as HTMLTextAreaElement;
-		this._textareaEl.placeholder = 'Plan, Build, / for commands, @ for context';
+		this._textareaEl.placeholder = t('Plan, Build, / for commands, @ for context');
 		this._textareaEl.rows = 1;
 
 		const footer = DOM.append(container, $('div.sc-input-footer'));
@@ -498,7 +499,7 @@ export class ChatInput extends Component {
 		const modeIconEl = DOM.append(modeBtn, $('span.sc-mode-icon'));
 		modeIconEl.innerHTML = '<svg width="14" height="14" viewBox="0 0 20 20" fill="none"><g stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><line x1="10" y1="3" x2="10" y2="4"/><line x1="6.5" y1="3.9378" x2="7" y2="4.8038"/><line x1="3.9378" y1="6.5" x2="4.8038" y2="7"/><line x1="3" y1="10" x2="4" y2="10"/><line x1="3.9378" y1="13.5" x2="4.8038" y2="13"/><line x1="6.5" y1="16.0622" x2="7" y2="15.1962"/><line x1="10" y1="17" x2="10" y2="16"/><line x1="13.5" y1="16.0622" x2="13" y2="15.1962"/><line x1="16.0622" y1="13.5" x2="15.1962" y2="13"/><line x1="17" y1="10" x2="16" y2="10"/><line x1="16.0622" y1="6.5" x2="15.1962" y2="7"/><line x1="13.5" y1="3.9378" x2="13" y2="4.8038"/></g></svg>';
 		this._modeLabel = DOM.append(modeBtn, $('span.sc-mode-label'));
-		this._modeLabel.textContent = 'Agent';
+		this._modeLabel.textContent = t('Agent');
 		const modeChevEl = document.createElement('span');
 		modeChevEl.classList.add(...ThemeIcon.asClassNameArray(Codicon.chevronDown), 'codicon-sm');
 		modeBtn.appendChild(modeChevEl);
@@ -508,7 +509,7 @@ export class ChatInput extends Component {
 		for (const mode of ['agent', 'plan', 'ask'] as AgentMode[]) {
 			const item = DOM.append(this._modeMenu, $('div.sc-mode-menu-item'));
 			item.dataset.mode = mode;
-			item.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
+			item.textContent = t(mode.charAt(0).toUpperCase() + mode.slice(1));
 			if (mode === 'agent') { item.classList.add('active'); }
 			this.on(item, 'click', () => {
 				this._setMode(mode);
@@ -815,7 +816,7 @@ export class ChatInput extends Component {
 
 	setMode(mode: AgentMode): void {
 		this._currentMode = mode;
-		this._modeLabel.textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
+		this._modeLabel.textContent = t(mode.charAt(0).toUpperCase() + mode.slice(1));
 		this._modeMenu.querySelectorAll('.sc-mode-menu-item').forEach(item => {
 			(item as HTMLElement).classList.toggle('active', (item as HTMLElement).dataset.mode === mode);
 		});
@@ -828,7 +829,7 @@ export class ChatInput extends Component {
 		const base = known?.name || model.replace(/^[a-z0-9-]+\//, '') || model;
 		this._modelLabel.textContent = this._reasoningLevel === 'None'
 			? base
-			: `${base} · ${this._reasoningLevel}`;
+			: `${base} · ${t(this._reasoningLevel)}`;
 	}
 
 	getModel(): string { return this._currentModel; }
@@ -916,14 +917,14 @@ export class ChatInput extends Component {
 
 		const ticks = DOM.append(rSliderContainer, $('div.sc-model-menu-reasoning-ticks'));
 		for (const label of ['None', 'Low', 'Med', 'High', 'Ultra']) {
-			DOM.append(ticks, $('span')).textContent = label;
+			DOM.append(ticks, $('span')).textContent = t(label);
 		}
 
 		const commitLevel = (lvl: 'None' | 'Low' | 'Medium' | 'High' | 'Ultra') => {
 			this._reasoningLevel = lvl;
 			this._maxMode = lvl === 'Ultra';
 			try { localStorage.setItem(ChatInput.REASONING_STORAGE_KEY, lvl); } catch { /* */ }
-			rVal.textContent = lvl;
+			rVal.textContent = t(lvl);
 			const idx = ChatInput.REASONING_LEVELS.indexOf(lvl);
 			rSlider.value = String(idx < 0 ? 0 : idx);
 			ultraToggle.classList.toggle('on', this._maxMode);
@@ -940,7 +941,7 @@ export class ChatInput extends Component {
 
 		const currentIdx = ChatInput.REASONING_LEVELS.indexOf(this._reasoningLevel);
 		rSlider.value = currentIdx !== -1 ? String(currentIdx) : '0';
-		rVal.textContent = this._reasoningLevel;
+		rVal.textContent = t(this._reasoningLevel);
 		this._paintEffortTicks(ticks, currentIdx !== -1 ? currentIdx : 0);
 		this._maxMode = this._reasoningLevel === 'Ultra';
 		ultraToggle.classList.toggle('on', this._maxMode);

@@ -12,6 +12,7 @@ import { Range } from '../../../../../editor/common/core/range.js';
 import { InlineEditInputWidget } from './inlineEditInputWidget.js';
 import { computeDiff } from '../components/diff/diffAlgorithm.js';
 import { serverWsUrl } from '../localServer.js';
+import { t } from '../i18n.js';
 
 export class InlineEditController extends Disposable {
 	private _inputWidget: InlineEditInputWidget | null = null;
@@ -243,14 +244,14 @@ export class InlineEditController extends Disposable {
 
 		const acceptBtn = document.createElement('button');
 		acceptBtn.className = 'sidex-inline-edit-accept';
-		acceptBtn.textContent = 'Accept';
-		acceptBtn.title = 'Accept edit (Enter)';
+		acceptBtn.textContent = t('Accept');
+		acceptBtn.title = t('Accept edit (Enter)');
 		acceptBtn.addEventListener('click', () => this.accept());
 
 		const rejectBtn = document.createElement('button');
 		rejectBtn.className = 'sidex-inline-edit-reject';
-		rejectBtn.textContent = 'Reject';
-		rejectBtn.title = 'Reject edit (Escape)';
+		rejectBtn.textContent = t('Reject');
+		rejectBtn.title = t('Reject edit (Escape)');
 		rejectBtn.addEventListener('click', () => this.reject());
 
 		widget.appendChild(acceptBtn);
