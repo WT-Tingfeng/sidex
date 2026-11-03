@@ -1,0 +1,42 @@
+name: Build sidex-server (Windows, test)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Setup MinGW (CGO)
+        shell: pwsh
+        run: |
+          choco install mingw -y --no-progress
+          echo "C:\ProgramData\mingw64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build sidex-server.exe
+        shell: pwsh
+        working-directory: sidexai/sidex-server
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          gcc --version
+          go version
+          go build -tags fts5 -o sidex-server.exe ./cmd/server
+          Get-Item sidex-server.exe | Format-List Length,Name
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidex-server-windows
+          path: sidexai/sidex-server/sidex-server.exe
+          retention-days: 7
