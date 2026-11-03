@@ -46,7 +46,15 @@ func ConfiguredLocalProviders() []ProviderConfig {
 			continue
 		}
 		rest := strings.TrimPrefix(key, envProviderPrefix)
-		for _, suf := range []string{envKeySuffix, envBaseURLSuffix, envAuthModeSuffix, envAccountIDSuffix} {
+		for _, suf := range []string{
+			envKeySuffix,
+			envBaseURLSuffix,
+			envAuthModeSuffix,
+			envAuthStyleSuffix,
+			envProtocolSuffix,
+			envModelsSuffix,
+			envAccountIDSuffix,
+		} {
 			if strings.HasSuffix(rest, suf) {
 				add(strings.TrimSuffix(rest, suf))
 				break
@@ -101,6 +109,15 @@ func isCodexHost(cfg ProviderConfig) bool {
 }
 
 func applyListHeaders(req *http.Request, cfg ProviderConfig) {
+	// A custom provider may declare the Anthropic wire protocol and its own
+	// credential header; honour both before the per-provider quirks below.
+	if cfg.Protocol == ProtocolAnthropic {
+		req.Header.Set("anthropic-version", anthropicVersion)
+	}
+	if cfg.AuthStyle != "" {
+		applyAuthStyle(req, cfg.AuthStyle, cfg.APIKey)
+		return
+	}
 	if cfg.Provider == "anthropic" {
 		req.Header.Set("anthropic-version", anthropicVersion)
 		if cfg.AuthMode == AuthModeOAuth && cfg.APIKey != "" {

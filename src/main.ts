@@ -6,7 +6,10 @@
 import { loadNlsMessages } from './nls-loader.js';
 
 const SPLASH_ID = 'sidex-splash';
-const SPLASH_FADE_MS = 300;
+// Keep in sync with the #sidex-splash transition in index.html. Short enough
+// that the fade does not add a visible delay once the workbench has mounted.
+const SPLASH_FADE_MS = 120;
+const SPLASH_FADE_CLEANUP_MS = 60;
 const SPLASH_SAFETY_TIMEOUT_MS = 15_000;
 
 let splashRemoved = false;
@@ -45,7 +48,7 @@ function removeSplash() {
 	}
 
 	splash.classList.add('sidex-splash-hiding');
-	window.setTimeout(() => splash.remove(), SPLASH_FADE_MS + 100);
+	window.setTimeout(() => splash.remove(), SPLASH_FADE_MS + SPLASH_FADE_CLEANUP_MS);
 }
 
 /**

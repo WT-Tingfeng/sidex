@@ -3,6 +3,7 @@ package ai
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -83,6 +84,12 @@ type Client struct {
 	// WithProviderConfig strips the prefix from the model id, so it can no
 	// longer be recovered from the model string alone.
 	provider string
+	// authStyle is a custom provider's credential header style (bearer,
+	// x-api-key, api-key, none). Empty keeps the per-provider default.
+	authStyle string
+	// protocol overrides the wire protocol ("openai" or "anthropic") for a
+	// custom provider. Empty infers it from the provider id.
+	protocol string
 	// accountID is the ChatGPT account UUID for a Codex OAuth login.
 	accountID  string
 	httpClient *http.Client
@@ -129,6 +136,8 @@ func (c *Client) WithModel(model string) *Client {
 		apiKey:     c.apiKey,
 		baseURL:    c.baseURL,
 		authMode:   c.authMode,
+		authStyle:  c.authStyle,
+		protocol:   c.protocol,
 		provider:   c.provider,
 		accountID:  c.accountID,
 		model:      model,
@@ -136,8 +145,17 @@ func (c *Client) WithModel(model string) *Client {
 	}
 }
 
+// WithProviderConfig returns a client bound to a direct provider endpoint.
+//
+// An empty API key is only meaningful for a keyless endpoint: a loopback
+// server (Ollama, LM Studio, a local gateway) or a provider that explicitly
+// declares AUTH_STYLE=none. For anything else the current client is kept, so
+// an unusable config cannot silently reroute traffic away from OpenRouter.
 func (c *Client) WithProviderConfig(cfg ProviderConfig) *Client {
-	if !cfg.Enabled || cfg.APIKey == "" || cfg.BaseURL == "" {
+	if !cfg.Enabled || cfg.BaseURL == "" {
+		return c
+	}
+	if cfg.APIKey == "" && cfg.AuthStyle != AuthStyleNone && !isLoopback(cfg.BaseURL) {
 		return c
 	}
 	model := c.model
@@ -148,10 +166,54 @@ func (c *Client) WithProviderConfig(cfg ProviderConfig) *Client {
 		apiKey:     cfg.APIKey,
 		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
 		authMode:   cfg.AuthMode,
+		authStyle:  cfg.AuthStyle,
+		protocol:   cfg.Protocol,
 		provider:   cfg.Provider,
 		accountID:  cfg.AccountID,
 		model:      model,
 		httpClient: c.httpClient,
+	}
+}
+
+// usesAnthropicProtocol reports whether requests must go to the Anthropic
+// Messages API instead of OpenAI-compatible chat completions.
+func (c *Client) usesAnthropicProtocol() bool {
+	switch c.protocol {
+	case ProtocolAnthropic:
+		return true
+	case ProtocolOpenAI:
+		return false
+	}
+	return IsAnthropicNative(c.provider)
+}
+
+// applyAuthHeaders sets the credential header for a custom provider's
+// declared auth style. A client without an auth style keeps the historical
+// header for its protocol (bearer on this OpenAI-compatible path).
+func (c *Client) applyAuthHeaders(req *http.Request) {
+	applyAuthStyle(req, c.authStyle, c.apiKey)
+}
+
+// applyAuthStyle sets the credential header selected by SIDEX_PROVIDER_
+// <ID>_AUTH_STYLE. An empty or unknown style means bearer.
+func applyAuthStyle(req *http.Request, style, apiKey string) {
+	switch style {
+	case AuthStyleNone:
+		// Keyless endpoint: send no credential at all.
+		return
+	case AuthStyleXAPIKey:
+		if apiKey != "" {
+			req.Header.Set("x-api-key", apiKey)
+		}
+		return
+	case AuthStyleAPIKey:
+		if apiKey != "" {
+			req.Header.Set("api-key", apiKey)
+		}
+		return
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 }
 
@@ -196,6 +258,19 @@ type StreamOptions struct {
 	// sends it on every /v1/messages request and omitting it is one of the
 	// signals that distinguishes a third-party client.
 	SessionID string
+	// Context, when non-nil, aborts the in-flight provider request when it is
+	// cancelled. The WebSocket read loop cancels it on a {"type":"cancel"}
+	// frame, so the Stop button (or closing a chat) stops generation promptly.
+	Context context.Context
+}
+
+// streamContext returns the request context for a stream call. Callers that
+// pass none get a background context, which never cancels.
+func streamContext(opts *StreamOptions) context.Context {
+	if opts != nil && opts.Context != nil {
+		return opts.Context
+	}
+	return context.Background()
 }
 
 func (c *Client) StreamChat(messages []Message, tools []ToolDef, systemPrompt string, onChunk func(StreamChunk)) error {
@@ -210,7 +285,7 @@ func (c *Client) StreamChatWithOptions(messages []Message, tools []ToolDef, syst
 			return fmt.Errorf("%s is not connected. Connect that account or add an API key in Settings → Models — SideX will not send this to OpenRouter.", p)
 		}
 	}
-	if IsAnthropicNative(c.provider) && c.apiKey != "" {
+	if c.usesAnthropicProtocol() {
 		return c.streamAnthropic(messages, tools, systemPrompt, opts, onChunk)
 	}
 	if isOpenAICodex(c) {
@@ -281,12 +356,13 @@ func (c *Client) StreamChatWithOptions(messages []Message, tools []ToolDef, syst
 
 	body, _ := json.Marshal(reqBody)
 
-	req, err := http.NewRequest("POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(streamContext(opts), "POST", c.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Accept", "text/event-stream")
+	c.applyAuthHeaders(req)
 	req.Header.Set("HTTP-Referer", "https://github.com/Sidenai/sidex")
 	req.Header.Set("X-Title", "SideX")
 
@@ -299,6 +375,23 @@ func (c *Client) StreamChatWithOptions(messages []Message, tools []ToolDef, syst
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("API error %d from %s: %s", resp.StatusCode, c.baseURL, sanitizeAPIErrorBody(resp.StatusCode, b))
+	}
+
+	// Some OpenAI-compatible endpoints ignore "stream": true and answer with a
+	// single JSON completion. Parse that body once instead of handing it to the
+	// SSE scanner, which would silently yield no output at all.
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(contentType, "text/event-stream") {
+		raw, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("read response: %w", readErr)
+		}
+		if handled, err := tryParseCompletionResponse(raw, onChunk); handled {
+			return err
+		}
+		// Not a completion object: some proxies stream SSE without setting the
+		// event-stream content type, so let the stream parser try the bytes.
+		return c.parseSSEStream(bytes.NewReader(raw), onChunk)
 	}
 
 	return c.parseSSEStream(resp.Body, onChunk)
@@ -433,11 +526,16 @@ func (c *Client) parseSSEStream(reader io.Reader, onChunk func(StreamChunk)) err
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		if !strings.HasPrefix(line, "data: ") {
+		// Accept both "data: {...}" (the SSE spec form) and "data:{...}":
+		// several OpenAI-compatible proxies omit the space after the colon.
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 
-		data := strings.TrimPrefix(line, "data: ")
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
 		if data == "[DONE]" {
 			if len(toolCalls) > 0 {
 				onChunk(StreamChunk{Type: "tool_calls_complete", ToolCalls: toolCalls})
@@ -447,6 +545,12 @@ func (c *Client) parseSSEStream(reader io.Reader, onChunk func(StreamChunk)) err
 		}
 
 		var chunk struct {
+			// In-band error frames look like {"error":{"message":"..."}} and
+			// must fail the turn instead of reading as an empty stream.
+			Error *struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+			} `json:"error"`
 			Choices []struct {
 				Delta struct {
 					Content   string `json:"content"`
@@ -471,6 +575,16 @@ func (c *Client) parseSSEStream(reader io.Reader, onChunk func(StreamChunk)) err
 
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+
+		// An in-band error object ends the turn with the provider's own
+		// message instead of looking like a stream that simply stopped.
+		if chunk.Error != nil {
+			msg := chunk.Error.Message
+			if msg == "" {
+				msg = "provider returned a stream error"
+			}
+			return fmt.Errorf("provider stream error: %s", msg)
 		}
 
 		// Handle usage info
@@ -542,6 +656,86 @@ func (c *Client) parseSSEStream(reader io.Reader, onChunk func(StreamChunk)) err
 	}
 	onChunk(StreamChunk{Type: "done", Done: true})
 	return nil
+}
+
+// tryParseCompletionResponse handles providers that ignore "stream": true and
+// answer with a single JSON completion object. It reports handled=false (and a
+// nil error) when the payload is not an OpenAI-shaped completion, so the caller
+// can fall back to the SSE parser.
+func tryParseCompletionResponse(raw []byte, onChunk func(StreamChunk)) (bool, error) {
+	var completion struct {
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &completion); err != nil {
+		return false, nil
+	}
+	if completion.Error != nil {
+		msg := completion.Error.Message
+		if msg == "" {
+			msg = "provider returned an error"
+		}
+		return true, fmt.Errorf("provider error: %s", msg)
+	}
+	if len(completion.Choices) == 0 {
+		return false, nil
+	}
+
+	choice := completion.Choices[0]
+	if choice.Message.Content != "" {
+		onChunk(StreamChunk{Type: "text", Content: choice.Message.Content})
+	}
+	for i, tc := range choice.Message.ToolCalls {
+		call := ToolCall{
+			ID:   tc.ID,
+			Type: tc.Type,
+			Function: ToolCallFunc{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			},
+		}
+		if call.Type == "" {
+			call.Type = "function"
+		}
+		if call.Function.Arguments == "" {
+			call.Function.Arguments = "{}"
+		}
+		if call.ID == "" {
+			// The agent correlates tool results by id; a provider that omits
+			// one would otherwise produce messages it cannot pair up.
+			call.ID = fmt.Sprintf("call_%d", i)
+		}
+		onChunk(StreamChunk{Type: "tool_call", ToolCalls: []ToolCall{call}})
+	}
+	if completion.Usage != nil {
+		onChunk(StreamChunk{Type: "usage", TokensUsed: &Usage{
+			PromptTokens:     completion.Usage.PromptTokens,
+			CompletionTokens: completion.Usage.CompletionTokens,
+			TotalTokens:      completion.Usage.TotalTokens,
+		}})
+	}
+	onChunk(StreamChunk{Type: "done", Done: true})
+	return true, nil
 }
 
 // ModelSupportsThinking returns true if the model supports extended thinking.

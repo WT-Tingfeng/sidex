@@ -1,6 +1,95 @@
 import { defineConfig } from 'vite';
+import type { HtmlTagDescriptor, Plugin } from 'vite';
 import * as path from 'path';
 import { nlsPlugin } from './scripts/vite-plugin-nls';
+
+/**
+ * Minimal shape of the Rollup chunks we care about. Kept local so the Vite
+ * config does not need a hard dependency on rollup's type package.
+ */
+type BundleChunk = {
+  type: 'chunk';
+  name: string;
+  fileName: string;
+  imports: string[];
+  viteMetadata?: { importedCss?: Set<string> };
+};
+
+/**
+ * src/main.ts reaches the workbench barrels through dynamic `import()`, so
+ * Vite cannot emit <link rel="modulepreload"> for them into index.html: the
+ * browser only discovers them after the entry chunk has been fetched and
+ * parsed — and that entry chunk is gated behind the multi-megabyte core/nls
+ * chunk. Injecting preloads into the HTML (with the real build hashes) lets
+ * those downloads start at parse time, in parallel with the core chunk,
+ * instead of a serial waterfall.
+ */
+const FIRST_SCREEN_CHUNK_NAMES = [
+  'workbench.common.main',
+  'workbench.web.main',
+  'web.main',
+  'dialog.web.contribution',
+];
+
+function firstScreenPreload(): Plugin {
+  return {
+    name: 'sidex-first-screen-preload',
+    apply: 'build',
+    enforce: 'post',
+    transformIndexHtml(html, ctx) {
+      const bundle = ctx.bundle;
+      if (!bundle) {
+        return [];
+      }
+
+      const existing = new Set<string>();
+      for (const match of html.matchAll(/href="([^"]+)"/g)) {
+        existing.add(match[1]);
+      }
+
+      const injected = new Set<string>();
+      const tags: HtmlTagDescriptor[] = [];
+      const has = (fileName: string) => injected.has(fileName) || existing.has('/' + fileName);
+
+      const visit = (chunk: BundleChunk) => {
+        if (!has(chunk.fileName)) {
+          injected.add(chunk.fileName);
+          tags.push({
+            tag: 'link',
+            attrs: { rel: 'modulepreload', crossorigin: '', href: '/' + chunk.fileName },
+            injectTo: 'head',
+          });
+        }
+        // Preload (not stylesheet) so these CSS files are fetched in parallel
+        // without becoming render-blocking for the inline splash screen.
+        for (const cssFile of chunk.viteMetadata?.importedCss ?? []) {
+          if (!has(cssFile)) {
+            injected.add(cssFile);
+            tags.push({
+              tag: 'link',
+              attrs: { rel: 'preload', as: 'style', href: '/' + cssFile },
+              injectTo: 'head',
+            });
+          }
+        }
+        for (const imported of chunk.imports) {
+          const dep = bundle[imported];
+          if (dep && dep.type === 'chunk') {
+            visit(dep as unknown as BundleChunk);
+          }
+        }
+      };
+
+      for (const output of Object.values(bundle)) {
+        if (output.type === 'chunk' && FIRST_SCREEN_CHUNK_NAMES.includes(output.name)) {
+          visit(output as unknown as BundleChunk);
+        }
+      }
+
+      return tags;
+    },
+  };
+}
 
 function quietMissingSourceMaps() {
   const skip = [/\/vscode-textmate\/.*\.js\.map$/];
@@ -24,7 +113,7 @@ export default defineConfig({
   clearScreen: false,
   assetsInclude: ['**/*.wasm', '**/*.json', '**/*.tmLanguage.json'],
   publicDir: 'public',
-  plugins: [nlsPlugin(), quietMissingSourceMaps()],
+  plugins: [nlsPlugin(), firstScreenPreload(), quietMissingSourceMaps()],
   server: {
     port: 1420,
     strictPort: true,

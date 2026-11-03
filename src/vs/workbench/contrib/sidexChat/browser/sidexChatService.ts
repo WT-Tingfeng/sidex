@@ -18,6 +18,7 @@ import { resolveServerEndpoint, serverWsUrl, SERVER_RESTARTED_EVENT } from './lo
 import { IProductService } from '../../../../platform/product/common/productService.js';
 import { IUpdateService } from '../../../../platform/update/common/update.js';
 import { IRecentEditTracker } from '../../sidexComplete/browser/recentEditTracker.js';
+import { decodeSettingValue, readSettingValue, toSettingBoolean } from './settings/settingsReadback.js';
 
 export interface IWorkspaceContext {
 	activeFile: string | null;
@@ -52,8 +53,11 @@ export interface IStreamChunk {
 		| 'thinking' | 'thinking_done' | 'permission_request' | 'turn_complete'
 		| 'subagent_spawned' | 'subagent_update' | 'subagent_complete'
 		| 'subagent_start' | 'subagent_running' | 'subagent_done'
-		| 'ask_question' | 'checkpoint_created' | 'checkpoint_restored';
+		| 'ask_question' | 'checkpoint_created' | 'checkpoint_restored'
+		| 'canceled';
 	content?: string;
+	/** Server-side session this chunk belongs to (background turns are tagged). */
+	session_id?: string;
 	error?: string;
 	done?: boolean;
 	tool_calls?: Array<{
@@ -100,6 +104,20 @@ export interface IStreamChunk {
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
 export type AgentMode = 'agent' | 'plan' | 'ask';
 export type PermissionMode = 'default' | 'auto_edits' | 'plan_only' | 'auto_all';
+
+/** Settings → Tools & MCPs → Auto-Run Mode values mapped to the wire permission mode. */
+const AUTO_RUN_SETTING_KEY = 'tools.autoRunMode';
+const AUTO_RUN_PERMISSION_MODES: Record<string, PermissionMode> = {
+	'Run Everything (Unsandboxed)': 'auto_all',
+	'Ask for approval': 'default',
+	'Sandboxed': 'plan_only',
+};
+/** Settings → Configuration → Background. */
+const CASCADE_BACKGROUND_SETTING_KEY = 'sidex.cascade.background';
+const BACKGROUND_SETTING_TTL_MS = 15000;
+/** Bounded per-session chunk buffers for turns running while another chat is visible. */
+const MAX_BUFFERED_CHUNKS_PER_SESSION = 4000;
+const MAX_BUFFERED_SESSIONS = 20;
 
 export const ISidexChatService = createDecorator<ISidexChatService>('sidexChatService');
 
@@ -173,6 +191,21 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 	private _isThinking = false;
 	private _currentMode: AgentMode = 'agent';
 	private _permissionMode: PermissionMode = 'default';
+	private _cascadeBackground = true;
+	private _cascadeBackgroundAt = 0;
+	/** Session key of the turn currently being streamed into the visible chat. */
+	private _activeTurnKey: string | null = null;
+	private _lastSentSessionId: string | null = null;
+	private _turnGeneration = 0;
+	private readonly _turnChunkBuffers = new Map<string, IStreamChunk[]>();
+	private readonly _turnSessionAliases = new Map<string, string>();
+	/**
+	 * Turns cancelled because the user switched away with background disabled
+	 * (or pressed Stop): session key -> turn generation at cancel time. The
+	 * generation lets the terminal chunk of the cancelled turn be ignored once a
+	 * newer turn has started on the same session key.
+	 */
+	private readonly _cancelledTurnSessions = new Map<string, number>();
 	private _serverModel = '';
 	private _maxMode = false;
 	private _thinkingBudget = 0;
@@ -268,11 +301,24 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 		window.addEventListener('sidex-models-changed', onModelsChanged);
 		this._register({ dispose: () => window.removeEventListener('sidex-models-changed', onModelsChanged) });
 
+		// Auto-run / background settings are cached; drop the caches as soon as
+		// the settings UI reports a change so the next send/switch sees it.
+		const onSettingsChanged = () => {
+			this._cascadeBackgroundAt = 0;
+			void this._resolveCascadeBackground();
+		};
+		window.addEventListener('sidex-settings-changed', onSettingsChanged);
+		this._register({ dispose: () => window.removeEventListener('sidex-settings-changed', onSettingsChanged) });
+
 		// Fetch real OS info from Tauri
 		this._fetchOsInfo();
 		
 		// Fetch models immediately, don't wait for WebSocket
 		this._fetchServerInfo();
+
+		// Prime the background-setting cache; permission_mode is read on every
+		// send so an Auto-Run change applies to the very next message.
+		void this._resolveCascadeBackground();
 
 
 		// A restart we asked for is not an outage: drop the dead socket and
@@ -564,6 +610,9 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 		}
 
 		this._setStreaming(true);
+		this._turnGeneration++;
+		this._lastSentSessionId = this._sessionId;
+		this._activeTurnKey = this._sessionId;
 		void this._sendWithContext(text);
 	}
 
@@ -650,6 +699,11 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 	}
 
 	private async _sendWithContext(text: string): Promise<void> {
+		// permission_mode comes from the Auto-Run Mode setting, not a constant.
+		// Reading is cached and non-fatal, so a settings IPC problem keeps the
+		// current mode instead of dropping the message.
+		await this._resolvePermissionMode();
+
 		let contextPrefix = '';
 		const codebaseMatch = text.match(/@codebase\s*(.*)/);
 		if (LOCAL_TOOLS_SUPPORTED() && this._contextIndexed && (this._useDynamicContext || codebaseMatch)) {
@@ -754,6 +808,9 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 	}
 
 	clearMessages(): void {
+		// Leaving the chat to start a new one is a session switch: with cascade
+		// background disabled the in-flight turn must be cancelled server-side.
+		this._cancelTurnIfBackgroundDisabled(null);
 		this._messages = [];
 		this._revertedMessages = [];
 		this._sessionId = null;
@@ -786,6 +843,9 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 	async loadSessionAsync(sessionId: string): Promise<void> {
 		const invoke = SidexChatService._getTauriInvoke();
 		if (!invoke) { return; }
+		// Switching chats: keep the old turn running only when cascade
+		// background is enabled, otherwise cancel it on the server.
+		this._cancelTurnIfBackgroundDisabled(sessionId);
 		try {
 			const dbMessages = await invoke('session_load', { sessionId }) as Array<{
 				id: string; session_id: string; role: string; content: string;
@@ -814,6 +874,9 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 			}
 			this._setStreaming(false);
 			this._onDidChangeMessages.fire(this._messages);
+			// A turn may have kept streaming in the background while another
+			// chat was visible — rebuild it now that this session is active.
+			this._replaySessionChunks(sessionId);
 		} catch { /* ignore */ }
 	}
 
@@ -823,6 +886,7 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 		try {
 			await invoke('session_delete', { sessionId });
 			this._cachedSessions = this._cachedSessions.filter(s => s.id !== sessionId);
+			this._dropSessionBuffers(sessionId);
 		} catch { /* ignore */ }
 	}
 
@@ -895,6 +959,11 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 			this._dbSessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		}
 		const dbId = this._dbSessionId;
+		// A turn may have started before the DB row existed, so its buffer key is a
+		// client/server session id. Alias it to the DB id history reloads use.
+		if (this._activeTurnKey) {
+			this._turnSessionAliases.set(this._activeTurnKey, dbId);
+		}
 
 		const firstUserMsg = this._messages.find(m => m.role === 'user');
 		const title = firstUserMsg
@@ -1002,8 +1071,217 @@ export class SidexChatService extends Disposable implements ISidexChatService {
 	}
 
 	stopStreaming(): void {
+		// Stop means stop on the server too: send the cancel frame first, then
+		// drop local streaming state (the Go stream handler aborts the turn).
+		const turnKey = this._activeTurnKey;
+		this._sendCancelFrame();
+		if (turnKey) {
+			// Keep the key until the terminal chunk: chunks that were already in
+			// flight must not be rendered as a fresh message after Stop.
+			this._cancelledTurnSessions.set(turnKey, this._turnGeneration);
+			this._turnChunkBuffers.delete(turnKey);
+		}
 		this._currentAssistantMessage = null;
 		this._setStreaming(false);
+	}
+
+	// ─── Behavior settings (auto-run / cascade background) ──────────────────
+
+	/**
+	 * Read Settings → Tools & MCPs → Auto-Run Mode and translate it into the
+	 * permission_mode the server understands. Read per send so an Auto-Run change
+	 * applies to the very next message; the IPC read is local and cheap.
+	 */
+	private async _resolvePermissionMode(): Promise<PermissionMode> {
+		let resolved: PermissionMode = this._permissionMode;
+		try {
+			const raw = await readSettingValue(SidexChatService._getTauriInvoke(), AUTO_RUN_SETTING_KEY);
+			const value = typeof raw === 'string' ? raw.trim() : '';
+			const mapped = AUTO_RUN_PERMISSION_MODES[value];
+			if (mapped) {
+				resolved = mapped;
+			}
+		} catch { /* settings IPC is best-effort; keep the current mode */ }
+		this.setPermissionMode(resolved);
+		return resolved;
+	}
+
+	/** Read Settings → Configuration → Background. Defaults to true (settings default). */
+	private async _resolveCascadeBackground(force = false): Promise<boolean> {
+		const now = Date.now();
+		if (!force && this._cascadeBackgroundAt && now - this._cascadeBackgroundAt < BACKGROUND_SETTING_TTL_MS) {
+			return this._cascadeBackground;
+		}
+		try {
+			const raw = await readSettingValue(SidexChatService._getTauriInvoke(), CASCADE_BACKGROUND_SETTING_KEY);
+			this._cascadeBackground = toSettingBoolean(raw, true);
+		} catch {
+			this._cascadeBackground = true;
+		}
+		this._cascadeBackgroundAt = now;
+		return this._cascadeBackground;
+	}
+
+	/**
+	 * Session switch policy: with cascade background disabled, a turn that is
+	 * still running must be cancelled on the server; with it enabled the turn
+	 * keeps running and its chunks are buffered for replay.
+	 */
+	private _cancelTurnIfBackgroundDisabled(targetSessionId: string | null): void {
+		const turnKey = this._activeTurnKey;
+		if (!this._isStreaming || !turnKey) {
+			return;
+		}
+		if (targetSessionId && (targetSessionId === turnKey || targetSessionId === this._sessionId || targetSessionId === this._dbSessionId)) {
+			return;
+		}
+		const generation = this._turnGeneration;
+		void this._resolveCascadeBackground(true).then(background => {
+			// A newer turn supersedes this decision; otherwise cancel even though
+			// the caller may already have cleared local streaming state.
+			if (background || generation !== this._turnGeneration) {
+				return;
+			}
+			this._sendCancelFrame();
+			this._cancelledTurnSessions.set(turnKey, generation);
+			this._turnChunkBuffers.delete(turnKey);
+			if (this._activeTurnKey === turnKey) {
+				// Keep the turn key until the server's terminal chunk arrives so
+				// untagged late chunks are still attributed to the cancelled turn
+				// (and therefore dropped) instead of bleeding into the new chat.
+				this._currentAssistantMessage = null;
+				this._setStreaming(false);
+			}
+		});
+	}
+
+	/** Send the protocol frame that asks the Go stream handler to abort the turn. */
+	private _sendCancelFrame(): void {
+		if (this._ws && this._connectionState === 'connected') {
+			try {
+				this._ws.send(JSON.stringify({ type: 'cancel' }));
+			} catch { /* socket already closing */ }
+		}
+	}
+
+	/** The active turn is over: drop its replay buffer and forget the key. */
+	private _finishActiveTurn(): void {
+		if (this._activeTurnKey) {
+			this._turnChunkBuffers.delete(this._activeTurnKey);
+		}
+		this._activeTurnKey = null;
+		this._lastSentSessionId = null;
+	}
+
+	/** Server assigned a session id mid-turn — move the buffered turn onto it. */
+	private _remapTurnSession(previousId: string, nextId: string): void {
+		const buffer = this._turnChunkBuffers.get(previousId);
+		if (buffer) {
+			this._turnChunkBuffers.delete(previousId);
+			this._turnChunkBuffers.set(nextId, buffer);
+		}
+		if (this._activeTurnKey === previousId) {
+			this._activeTurnKey = nextId;
+		}
+		if (this._lastSentSessionId === previousId) {
+			this._lastSentSessionId = nextId;
+		}
+		// Remember both ids as aliases of the session row that owns the turn.
+		const owner = this._dbSessionId ?? previousId;
+		this._turnSessionAliases.set(nextId, owner);
+		this._turnSessionAliases.set(previousId, owner);
+	}
+
+	/** True when the given server-side session id belongs to the visible chat. */
+	private _isVisibleSessionId(sessionId: string): boolean {
+		const active = new Set<string>();
+		for (const id of [this._sessionId, this._dbSessionId]) {
+			if (id) {
+				active.add(id);
+			}
+		}
+		for (const [serverId, owner] of this._turnSessionAliases) {
+			if (active.has(serverId) || active.has(owner)) {
+				active.add(serverId);
+				active.add(owner);
+			}
+		}
+		return active.has(sessionId);
+	}
+
+	/** Bounded per-session chunk buffer; ordered so replay reproduces the turn. */
+	private _recordTurnChunk(key: string | null, chunk: IStreamChunk): void {
+		if (!key) {
+			return;
+		}
+		let buffer = this._turnChunkBuffers.get(key);
+		if (!buffer) {
+			if (this._turnChunkBuffers.size >= MAX_BUFFERED_SESSIONS) {
+				const oldest = this._turnChunkBuffers.keys().next().value;
+				if (oldest) {
+					this._turnChunkBuffers.delete(oldest);
+				}
+			}
+			buffer = [];
+			this._turnChunkBuffers.set(key, buffer);
+		}
+		const previous = buffer[buffer.length - 1];
+		if ((chunk.type === 'text' || chunk.type === 'thinking')
+			&& previous && previous.type === chunk.type
+			&& typeof previous.content === 'string' && typeof chunk.content === 'string') {
+			// Coalesce token-by-token streaming so a long turn cannot overflow
+			// the replay buffer; replaying the merged text is equivalent.
+			buffer[buffer.length - 1] = { ...previous, content: previous.content + chunk.content };
+			return;
+		}
+		buffer.push(chunk);
+		if (buffer.length > MAX_BUFFERED_CHUNKS_PER_SESSION) {
+			buffer.splice(0, buffer.length - MAX_BUFFERED_CHUNKS_PER_SESSION);
+		}
+	}
+
+	/** Replay a background turn into the now-active session. */
+	private _replaySessionChunks(sessionId: string): void {
+		const keys = new Set<string>([sessionId]);
+		for (const [serverId, owner] of this._turnSessionAliases) {
+			if (owner === sessionId || serverId === sessionId) {
+				keys.add(serverId);
+				keys.add(owner);
+			}
+		}
+
+		const pending: IStreamChunk[] = [];
+		for (const key of keys) {
+			const buffer = this._turnChunkBuffers.get(key);
+			if (buffer && buffer.length > 0) {
+				pending.push(...buffer);
+			}
+			this._turnChunkBuffers.delete(key);
+		}
+		if (pending.length === 0) {
+			return;
+		}
+
+		const inFlight = !pending.some(c => c.type === 'done' || c.type === 'error');
+		this._activeTurnKey = sessionId;
+		if (inFlight) {
+			this._setStreaming(true);
+		}
+		for (const chunk of pending) {
+			this._handleChunk(chunk);
+		}
+	}
+
+	/** Drop buffered chunks when a chat is deleted. */
+	private _dropSessionBuffers(sessionId: string): void {
+		this._cancelledTurnSessions.delete(sessionId);
+		this._turnChunkBuffers.delete(sessionId);
+		for (const [serverId, owner] of [...this._turnSessionAliases]) {
+			if (owner === sessionId) {
+				this._turnChunkBuffers.delete(serverId);
+				this._turnSessionAliases.delete(serverId);
+			}
+		}
 	}
 
 	private async _handleLocalToolRequest(req: ILocalToolRequest): Promise<void> {
@@ -1596,12 +1874,61 @@ ${prompt}`,
 	}
 
 	private _handleChunk(chunk: IStreamChunk): void {
+		// Route chunks by session. An explicit server tag wins; when the Go
+		// stream does not tag a chunk, attribute it to the running turn — that is
+		// correct because the server executes one turn at a time per socket.
+		// Chunks for a session other than the visible one (a background turn) are
+		// buffered here and replayed when the user switches back.
+		const chunkSessionId = chunk.session_id || this._activeTurnKey;
+
+		// The Go stream acknowledges a cancel frame with {type:'canceled'}; the
+		// aborted turn then emits its regular done. The ack carries no UI state.
+		if (chunk.type === 'canceled') {
+			return;
+		}
+
+		// Late chunks from a turn that was already cancelled are dropped instead
+		// of resurrecting a stopped turn in some other chat.
+		const cancelledGeneration = chunkSessionId ? this._cancelledTurnSessions.get(chunkSessionId) : undefined;
+		if (chunkSessionId && chunk.type !== 'session' && cancelledGeneration !== undefined) {
+			if (chunk.type === 'done' || chunk.type === 'error') {
+				this._cancelledTurnSessions.delete(chunkSessionId);
+				// Only tear down the turn if a newer generation has not already
+				// started; otherwise the key now belongs to the new turn.
+				if (cancelledGeneration === this._turnGeneration && this._activeTurnKey === chunkSessionId) {
+					this._finishActiveTurn();
+				}
+			}
+			return;
+		}
+
+		if (chunkSessionId && chunk.type !== 'session' && !this._isVisibleSessionId(chunkSessionId)) {
+			this._recordTurnChunk(chunkSessionId, chunk);
+			if (chunkSessionId === this._activeTurnKey && (chunk.type === 'done' || chunk.type === 'error')) {
+				// The background turn finished while another chat was visible;
+				// keep the buffered chunks for replay, but stop attributing new
+				// chunks to it.
+				this._activeTurnKey = null;
+			}
+			return;
+		}
+
+		// Keep a per-turn chunk log for the active session too, so switching
+		// away mid-turn and back can rebuild the in-flight assistant message.
+		if (this._activeTurnKey && chunk.type !== 'session') {
+			this._recordTurnChunk(this._activeTurnKey, chunk);
+		}
+
 		this._onDidReceiveChunk.fire(chunk);
 
 		switch (chunk.type) {
 			case 'session':
 				if (chunk.content) {
+					const previousId = this._sessionId;
 					this._sessionId = chunk.content;
+					if (previousId && previousId !== chunk.content) {
+						this._remapTurnSession(previousId, chunk.content);
+					}
 				}
 				break;
 
@@ -1726,6 +2053,7 @@ ${prompt}`,
 					this._indexDirty = false;
 					this._scheduleReindex();
 				}
+				this._finishActiveTurn();
 				break;
 
 			case 'error':
@@ -1737,6 +2065,7 @@ ${prompt}`,
 					this._currentAssistantMessage = null;
 				}
 				this._setStreaming(false);
+				this._finishActiveTurn();
 				this._onDidChangeMessages.fire(this._messages);
 				break;
 
@@ -2072,10 +2401,19 @@ ${prompt}`,
 				}
 			}
 
+			// Settings → Models owns the catalogue: only models the user enabled
+			// are offered here (custom IDs are merged above and are written into
+			// that same enabled list). An unset value keeps the historic
+			// behaviour of offering every model the connected providers serve.
+			const enabledDecoded = decodeSettingValue(enabledRaw);
+			if (Array.isArray(enabledDecoded)) {
+				const enabledIds = new Set(enabledDecoded.filter((id): id is string => typeof id === 'string' && id.trim().length > 0));
+				models = models.filter(m => enabledIds.has(m.id));
+			}
+
 			// The server list is live from each connected provider (Claude,
-			// Codex, Ollama, …). Do not filter it down to a hardcoded ID
-			// allowlist — that hides new snapshots the moment a provider
-			// ships them. Custom IDs the user typed are already merged above.
+			// Codex, Ollama, …); never filter it against a hardcoded ID allowlist
+			// — that hides new snapshots the moment a provider ships them.
 			this._availableModels = models;
 			this._onDidChangeModels.fire(this._availableModels);
 

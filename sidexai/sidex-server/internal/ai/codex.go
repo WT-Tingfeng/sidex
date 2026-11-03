@@ -216,7 +216,7 @@ func (c *Client) streamCodex(
 		return fmt.Errorf("failed to encode request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", strings.TrimRight(c.baseURL, "/")+"/responses", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(streamContext(opts), "POST", strings.TrimRight(c.baseURL, "/")+"/responses", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}

@@ -61,6 +61,97 @@ const sidexTranslations: Record<string, Translations> = {
 		remoteExplorer: '원격 탐색기'
 	}
 };
+// ─── Startup-safe translation loading ───────────────────────────────────────
+// loadNlsMessages() runs before any VS Code module is imported (localize() is
+// evaluated at module top-level), so it must never be able to hang the boot.
+// Disk lookups go through the Rust extension manager (platform-correct user
+// extensions dir); the marketplace/open-vsx fallbacks are hard-bounded so a
+// blocked host degrades to an English launch instead of a frozen splash.
+
+/** Timeout for one marketplace/open-vsx metadata request. */
+const NLS_FETCH_TIMEOUT_MS = 600;
+/** Timeout for one translation-bundle download. */
+const NLS_BUNDLE_TIMEOUT_MS = 800;
+/** Hard cap for the whole gallery fallback (metadata + bundle). */
+const NLS_GALLERY_BUDGET_MS = 1600;
+/** Timeout for the local nls.messages.json index (embedded asset). */
+const NLS_INDEX_TIMEOUT_MS = 1200;
+
+type TauriInvokeFn = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+async function getTauriInvoke(): Promise<TauriInvokeFn | null> {
+	try {
+		const { invoke } = await import('@tauri-apps/api/core');
+		return invoke as TauriInvokeFn;
+	} catch {
+		return null;
+	}
+}
+
+/** fetch() bounded by a timeout; rejects with an AbortError on expiry. */
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+	try {
+		return await fetch(url, { signal: controller.signal });
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * extensionId (lowercased) -> real on-disk extension directory, resolved once
+ * per launch through the Rust extension manager. The legacy
+ * ~/.sidex/extensions location is only a fallback for pre-0.1.5 installs.
+ */
+let installedExtensionDirsPromise: Promise<Map<string, string>> | undefined;
+
+function getInstalledExtensionDirs(): Promise<Map<string, string>> {
+	if (!installedExtensionDirsPromise) {
+		installedExtensionDirsPromise = (async () => {
+			const dirs = new Map<string, string>();
+			try {
+				const invoke = await getTauriInvoke();
+				if (!invoke) {
+					return dirs;
+				}
+				const installed = (await invoke('list_installed_extensions')) as
+					| Array<{ id?: string; path?: string }>
+					| null;
+				for (const entry of installed ?? []) {
+					if (entry?.id && entry?.path) {
+						dirs.set(entry.id.toLowerCase(), entry.path);
+					}
+				}
+			} catch {
+				/* extension manager unavailable — callers fall back to legacy paths */
+			}
+			return dirs;
+		})();
+	}
+	return installedExtensionDirsPromise;
+}
+
+async function getHomeDir(invoke: TauriInvokeFn | null): Promise<string | null> {
+	if (!invoke) {
+		return null;
+	}
+	return (
+		((await invoke('get_env', { key: 'HOME' }).catch(() => null)) as string | null) ??
+		((await invoke('get_env', { key: 'USERPROFILE' }).catch(() => null)) as string | null)
+	);
+}
+
+/** Resolve an extension directory: Rust extension manager first, legacy layout second. */
+async function resolveExtensionDir(extensionId: string): Promise<string | null> {
+	const dirs = await getInstalledExtensionDirs();
+	const fromManager = dirs.get(extensionId.toLowerCase());
+	if (fromManager) {
+		return fromManager;
+	}
+	const homedir = await getHomeDir(await getTauriInvoke());
+	return homedir ? `${homedir}/.sidex/extensions/${extensionId}` : null;
+}
 
 export async function loadNlsMessages(): Promise<void> {
 	const locale = localStorage.getItem('vscode.nls.locale');
@@ -102,8 +193,10 @@ export async function loadNlsMessages(): Promise<void> {
 			}
 		}
 
-		const indexRes = await fetch('/nls.messages.json');
-		if (indexRes.ok) {
+		// Local embedded index; bounded too so a broken asset protocol can never
+		// stall the boot. On failure we fall through to key-based lookup.
+		const indexRes = await fetchWithTimeout('/nls.messages.json', NLS_INDEX_TIMEOUT_MS).catch(() => null);
+		if (indexRes?.ok) {
 			const contentType = indexRes.headers.get('content-type') ?? '';
 			if (contentType.includes('json')) {
 				const nlsEntries: Array<{ key: string; msg: string }> = await indexRes.json();
@@ -126,18 +219,21 @@ export async function loadNlsMessages(): Promise<void> {
 
 async function loadFromDisk(extensionId: string): Promise<Translations | null> {
 	try {
-		const { invoke } = await import('@tauri-apps/api/core');
-
-		const homedir: string | null =
-			(await invoke<string>('get_env', { key: 'HOME' }).catch(() => null)) ??
-			(await invoke<string>('get_env', { key: 'USERPROFILE' }).catch(() => null));
-
-		if (!homedir) {
+		const invoke = await getTauriInvoke();
+		if (!invoke) {
 			return null;
 		}
 
-		const path = `${homedir}/.sidex/extensions/${extensionId}/translations/main.i18n.json`;
-		const raw = await invoke<string>('read_file', { path });
+		// Real, platform-correct extension directory (was hardcoded to
+		// ~/.sidex/extensions, which never matched %APPDATA%\SideX\extensions
+		// on Windows and forced a network round-trip on every launch).
+		const extensionDir = await resolveExtensionDir(extensionId);
+		if (!extensionDir) {
+			return null;
+		}
+
+		const path = `${extensionDir}/translations/main.i18n.json`;
+		const raw = (await invoke('read_file', { path })) as string;
 		const result = parseBundle(raw);
 		if (result) {
 			console.log(`[SideX NLS] Loaded translations from disk: ${path}`);
@@ -154,30 +250,44 @@ async function loadFromGallery(extensionId: string): Promise<Translations | null
 		return null;
 	}
 
+	// Every request is bounded and the whole fallback is capped: a blackholed
+	// marketplace/open-vsx connection must degrade to an English launch, not
+	// hold the splash screen hostage.
+	const deadline = Date.now() + NLS_GALLERY_BUDGET_MS;
+	const remaining = (cap: number) => Math.max(1, Math.min(cap, deadline - Date.now()));
 	const urls = [
 		`https://marketplace.siden.ai/api/gallery/publishers/${publisher}/vsextensions/${name}/latest/vspackage`,
 		`https://open-vsx.org/api/${publisher}/${name}/latest`
 	];
 
 	for (const metaUrl of urls) {
+		if (Date.now() >= deadline) {
+			break;
+		}
 		try {
-			const meta = await fetch(metaUrl).then(r => (r.ok ? r.json() : null));
+			const metaRes = await fetchWithTimeout(metaUrl, remaining(NLS_FETCH_TIMEOUT_MS));
+			const meta = metaRes.ok ? ((await metaRes.json()) as { version?: string } | null) : null;
 			if (!meta?.version) {
 				continue;
 			}
+			if (Date.now() >= deadline) {
+				break;
+			}
 			const translationUrl = `https://open-vsx.org/vscode/unpkg/${publisher}/${name}/${meta.version}/extension/translations/main.i18n.json`;
-			const res = await fetch(translationUrl);
+			const res = await fetchWithTimeout(translationUrl, remaining(NLS_BUNDLE_TIMEOUT_MS));
 			if (res.ok) {
 				const result = parseBundle(await res.text());
 				if (result) {
-					console.log(`[SideX NLS] Loaded translations from gallery`);
+					console.log('[SideX NLS] Loaded translations from gallery');
 					return result;
 				}
 			}
 		} catch {
+			// Timeout / offline / blocked: try the next source, then go English.
 			continue;
 		}
 	}
+	console.warn('[SideX NLS] Language pack could not be fetched in time; continuing in English');
 	return null;
 }
 
@@ -220,16 +330,25 @@ async function detectInstalledLanguagePack(locale: string): Promise<string | nul
 		return null;
 	}
 	try {
-		const { invoke } = await import('@tauri-apps/api/core');
-		const homedir: string | null =
-			(await invoke<string>('get_env', { key: 'HOME' }).catch(() => null)) ??
-			(await invoke<string>('get_env', { key: 'USERPROFILE' }).catch(() => null));
-		if (!homedir) {
+		// Ask the Rust extension manager where installed extensions really live
+		// (Windows: %APPDATA%\SideX\extensions, etc.) instead of assuming the
+		// legacy ~/.sidex/extensions layout.
+		const dirs = await getInstalledExtensionDirs();
+		if (dirs.has(knownId.toLowerCase())) {
+			return knownId;
+		}
+
+		// Legacy fallback for pre-0.1.5 installs that kept extensions in ~/.sidex.
+		const invoke = await getTauriInvoke();
+		const homedir = await getHomeDir(invoke);
+		if (!invoke || !homedir) {
 			return null;
 		}
 		const path = `${homedir}/.sidex/extensions/${knownId}/translations/main.i18n.json`;
-		await invoke<string>('read_file', { path });
-		return knownId;
+		if ((await invoke('read_file', { path }).catch(() => null)) !== null) {
+			return knownId;
+		}
+		return null;
 	} catch {
 		return null;
 	}

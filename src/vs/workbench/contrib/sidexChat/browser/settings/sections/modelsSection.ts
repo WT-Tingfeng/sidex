@@ -19,11 +19,61 @@ interface AccountInfo {
 	subscriptionTier: string | null;
 	accountEmail: string | null;
 }
-interface ProviderStatusInfo { id: string; label: string; baseUrl: string; configured: boolean; enabled: boolean; source: string | null; keyless: boolean; envVar: string | null }
+interface ProviderStatusInfo {
+	id: string;
+	label: string;
+	baseUrl: string;
+	configured: boolean;
+	enabled: boolean;
+	source: string | null;
+	keyless: boolean;
+	envVar: string | null;
+	/** New contract: an API key is stored for this provider (masked field). */
+	hasKey?: boolean;
+	/** True for providers defined in `sidex.providers.custom`. */
+	custom?: boolean;
+	protocol?: string | null;
+	authStyle?: string | null;
+}
 
 // The provider catalogue itself lives in Rust (providers_catalog) — this is
 // just the shape we render cards from, not a source of truth.
-interface ProviderCatalogEntry { id: string; label: string; defaultBaseUrl: string; envVars: string[]; consoleUrl: string; keyless: boolean }
+interface ProviderCatalogEntry {
+	id: string;
+	label: string;
+	defaultBaseUrl: string;
+	envVars: string[];
+	consoleUrl: string;
+	keyless: boolean;
+	custom?: boolean;
+	protocol?: string;
+	authStyle?: string;
+}
+
+/** A provider stored under the `sidex.providers.custom` setting. */
+interface CustomProviderDef {
+	id: string;
+	label: string;
+	/** `openai` (chat-completions compatible) or `anthropic` (messages compatible). */
+	protocol: string;
+	baseUrl: string;
+	/** `bearer`, `x-api-key`, `api-key` or `none`. */
+	auth: string;
+	models?: string[];
+}
+
+/** Result of the Rust `providers_test` command. */
+interface ProviderTestResult { ok: boolean; status?: number; latencyMs?: number; modelCount?: number; message?: string }
+
+type ApiKeyAction = 'keep' | 'set' | 'clear';
+
+const PROTOCOL_LABELS: Record<string, string> = { openai: 'OpenAI-compatible', anthropic: 'Anthropic-compatible' };
+const AUTH_LABELS: Record<string, string> = {
+	bearer: 'Bearer token',
+	'x-api-key': 'x-api-key header',
+	'api-key': 'api-key header',
+	none: 'No key',
+};
 
 // A configured key is never sent back to the UI. This placeholder marks a
 // field as already-set without exposing the value, and doubles as a sentinel
@@ -45,6 +95,13 @@ export class ModelsSection implements SettingsSection {
 	private _apiKeysContainer: HTMLElement | null = null;
 	private _discoveryContainer: HTMLElement | null = null;
 	private _customRowContainer: HTMLElement | null = null;
+	// Custom providers are defined in settings and merged into the render-only
+	// catalog below, so they get the same key/toggle cards as built-ins.
+	private _customProvidersContainer: HTMLElement | null = null;
+	private _customProviderDefs: CustomProviderDef[] = [];
+	private _customProviderFormOpen = false;
+	private _editingCustomProviderId: string | null = null;
+	private _customModelCounts: Map<string, number> = new Map();
 	// The catalog is pushing 30 providers. Once at least one is configured,
 	// the rest collapse behind a disclosure by default — this remembers that
 	// the user opened it, so re-rendering after a save doesn't snap it shut.
@@ -59,6 +116,12 @@ export class ModelsSection implements SettingsSection {
 		container.innerHTML = '';
 		await this._loadState();
 		this._renderModelListSection(container);
+
+		// Custom provider endpoints sit between the model list and the built-in
+		// provider catalogue: define an endpoint here, then enable its models.
+		this._customProvidersContainer = document.createElement('div');
+		container.appendChild(this._customProvidersContainer);
+		this._renderCustomProvidersSection(this._customProvidersContainer);
 
 		// Create API Keys Container placeholder and render it
 		this._apiKeysContainer = document.createElement('div');
@@ -105,6 +168,9 @@ export class ModelsSection implements SettingsSection {
 		try {
 			this._providerCatalog = (await this._invoke('providers_catalog') as ProviderCatalogEntry[]) || [];
 		} catch { this._providerCatalog = []; }
+
+		await this._loadCustomProviders();
+		this._mergeCustomProvidersIntoCatalog();
 
 		await this._refreshProviderStatus();
 	}
@@ -264,6 +330,27 @@ export class ModelsSection implements SettingsSection {
 		idInput.type = 'text';
 		idInput.placeholder = 'Model ID (e.g. anthropic/claude-opus-4.6)';
 
+		// The selected provider qualifies the id that actually gets routed:
+		// "<provider>/<input>", unless the input already carries that prefix.
+		const routeHint = document.createElement('div');
+		routeHint.className = 'sidex-settings-row-description';
+		routeHint.style.cssText = 'font-size:11px;display:none;';
+		const qualify = (raw: string): string => {
+			const value = raw.trim();
+			const provider = this._addModelProvider;
+			if (!provider || !value) { return value; }
+			return value.startsWith(`${provider}/`) ? value : `${provider}/${value}`;
+		};
+		const updateRouteHint = (): void => {
+			if (!this._addModelProvider) {
+				routeHint.style.display = 'none';
+				return;
+			}
+			routeHint.textContent = `Will route to ${qualify(idInput.value) || `${this._addModelProvider}/<model-id>`}`;
+			routeHint.style.display = '';
+		};
+		idInput.addEventListener('input', updateRouteHint);
+
 		const suggestions = document.createElement('div');
 		suggestions.style.cssText = 'font-size:11px;color:var(--vscode-descriptionForeground);display:flex;flex-direction:column;gap:4px;';
 
@@ -290,7 +377,7 @@ export class ModelsSection implements SettingsSection {
 				label.textContent = `${models.length} available — pick one, or type your own:`;
 				suggestions.appendChild(label);
 				suggestions.appendChild(this._boundedDropdown(
-					models.map(m => m.id), '', (value) => { idInput.value = value; }));
+					models.map(m => m.id), '', (value) => { idInput.value = value; updateRouteHint(); }));
 			} catch {
 				// Not configured, offline, or the provider just doesn't support
 				// listing — the manual text input below still works either way.
@@ -304,7 +391,11 @@ export class ModelsSection implements SettingsSection {
 		];
 		form.appendChild(this._boundedDropdown(providerOptions, this._addModelProvider, (value) => {
 			this._addModelProvider = value;
+			// Carry an already-typed id over to the new provider prefix instead of
+			// silently keeping it unprefixed (same prefix is left untouched).
+			if (idInput.value.trim()) { idInput.value = qualify(idInput.value); }
 			void loadSuggestions(value);
+			updateRouteHint();
 		}));
 		form.appendChild(suggestions);
 
@@ -321,7 +412,7 @@ export class ModelsSection implements SettingsSection {
 		addBtn.style.cssText = 'font-size:12px;cursor:pointer;font-weight:500;';
 		addBtn.textContent = 'Add';
 		addBtn.addEventListener('click', () => {
-			const val = idInput.value.trim();
+			const val = qualify(idInput.value);
 			if (val) { this._addCustomModel(val); }
 		});
 		row.appendChild(addBtn);
@@ -337,12 +428,14 @@ export class ModelsSection implements SettingsSection {
 		row.appendChild(cancelBtn);
 
 		idInput.addEventListener('keydown', (e) => {
-			if (e.key === 'Enter') { const v = idInput.value.trim(); if (v) { this._addCustomModel(v); } }
+			if (e.key === 'Enter') { const v = qualify(idInput.value); if (v) { this._addCustomModel(v); } }
 			if (e.key === 'Escape') { this._addingCustom = false; this._addModelProvider = ''; this._updateCustomRow(); }
 		});
 		form.appendChild(row);
+		form.appendChild(routeHint);
 		wrap.appendChild(form);
 
+		updateRouteHint();
 		if (this._addModelProvider) { void loadSuggestions(this._addModelProvider); }
 
 		return wrap;
@@ -440,6 +533,13 @@ export class ModelsSection implements SettingsSection {
 	 * this card rather than assume a console link and a working default.
 	 */
 	private _providerDescriptionHtml(config: ProviderCatalogEntry): string {
+		if (config.custom) {
+			// Custom endpoints are defined in this panel, not shipped by SideX, so
+			// point at where they can be edited instead of a key console.
+			return config.keyless
+				? `${config.label} is a custom endpoint that doesn't require a key. Edit or remove it under Custom Providers.`
+				: `Custom endpoint defined under Custom Providers. Enter an API key to use ${config.label} models.`;
+		}
 		if (config.keyless) {
 			return `${config.label} doesn't require a key. Set a base URL below if it isn't running at the default location.`;
 		}
@@ -525,7 +625,12 @@ export class ModelsSection implements SettingsSection {
 		fields.push({
 			id: 'baseUrl', type: 'text',
 			placeholder: needsBaseUrl ? 'Base URL (required, e.g. https://your-host/v1)' : config.defaultBaseUrl,
-			prefill: status?.baseUrl && status.baseUrl !== config.defaultBaseUrl ? status.baseUrl : undefined,
+			// A custom provider's endpoint is owned by the Custom Providers form
+			// (Rust reads it from settings, not from this key card), so show it
+			// read-only here instead of pretending an override would stick.
+			prefill: config.custom
+				? (status?.baseUrl || config.defaultBaseUrl || undefined)
+				: (status?.baseUrl && status.baseUrl !== config.defaultBaseUrl ? status.baseUrl : undefined),
 			required: needsBaseUrl,
 		});
 
@@ -536,6 +641,10 @@ export class ModelsSection implements SettingsSection {
 		errorEl.style.cssText = 'display:none;max-width:260px;color:var(--vscode-editorError-foreground, #f85149);';
 
 		const fieldInputs: Map<string, HTMLInputElement> = new Map();
+		// A masked field means "a key is stored", not "you may not change it":
+		// explicit Replace / Clear actions sit next to it (a disabled input was
+		// a dead end — nothing could ever remove or rotate the key).
+		const storedKey = this._hasStoredKey(status);
 		for (const field of fields) {
 			const wrapper = document.createElement('div');
 			wrapper.className = 'sidex-input-wrapper';
@@ -546,9 +655,16 @@ export class ModelsSection implements SettingsSection {
 				input.setAttribute('aria-required', 'true');
 			}
 			if (field.prefill) { input.value = field.prefill; }
-			if (hasCredential && field.type === 'password') {
+			const isKeyField = field.id === 'apiKey';
+			if (isKeyField && storedKey) {
 				input.value = MASKED_KEY;
-				input.disabled = true;
+				input.readOnly = true;
+				input.setAttribute('aria-label', 'Stored API key');
+			}
+			if (field.id === 'baseUrl' && config.custom) {
+				input.readOnly = true;
+				input.style.opacity = '0.8';
+				input.setAttribute('aria-label', 'Endpoint from Custom Providers');
 			}
 			// Saving restarts the server and re-renders this section, which
 			// destroys the focused input and fires another blur. Without an
@@ -556,8 +672,18 @@ export class ModelsSection implements SettingsSection {
 			// it always looks "dirty" on the way out.
 			const initialValue = input.value;
 			const saveIfChanged = async (): Promise<void> => {
-				if (input.value === initialValue || input.value === MASKED_KEY) { return; }
-				const error = await this._saveProviderKey(config, fieldInputs);
+				if (isKeyField) {
+					// The masked value is never a real key, and an empty key field
+					// means "leave the stored key alone" — only Clear removes it.
+					const replaced = !input.readOnly && input.value.trim().length > 0 && input.value !== MASKED_KEY;
+					if (!replaced) { return; }
+					const error = await this._saveProviderKey(config, fieldInputs, 'set');
+					errorEl.textContent = error ?? '';
+					errorEl.style.display = error ? '' : 'none';
+					return;
+				}
+				if (input.value === initialValue) { return; }
+				const error = await this._saveProviderKey(config, fieldInputs, 'keep');
 				errorEl.textContent = error ?? '';
 				errorEl.style.display = error ? '' : 'none';
 			};
@@ -571,6 +697,16 @@ export class ModelsSection implements SettingsSection {
 			wrapper.appendChild(input);
 			fieldInputs.set(field.id, input);
 			fieldsWrap.appendChild(wrapper);
+			if (isKeyField && storedKey) {
+				fieldsWrap.appendChild(this._buildKeyActionsRow(config, input, errorEl));
+			}
+			if (field.id === 'baseUrl' && config.custom) {
+				const note = document.createElement('div');
+				note.className = 'sidex-settings-row-description';
+				note.style.cssText = 'font-size:11px;max-width:260px;';
+				note.textContent = 'Edit this endpoint under Custom Providers.';
+				fieldsWrap.appendChild(note);
+			}
 		}
 		fieldsWrap.appendChild(errorEl);
 
@@ -646,6 +782,475 @@ export class ModelsSection implements SettingsSection {
 		link.addEventListener('click', () => { void run(); });
 
 		return wrap;
+	}
+
+	// ─── Custom providers ───────────────────────────────────────────────────
+	//
+	// Custom endpoints live in settings (`sidex.providers.custom`), not in the
+	// fixed Rust catalogue. Rust merges them into catalog/status/resolve; the
+	// panel mirrors them locally too, so a custom endpoint is listed even while
+	// the server is restarting (and on an older backend that hasn't merged it).
+
+	private async _loadCustomProviders(): Promise<void> {
+		if (!this._invoke) { return; }
+		try {
+			const raw = await this._invoke('settings_get', { section: 'sidex.providers.custom' });
+			const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+			// Rust ignores entries that shadow a built-in provider or that have an
+			// id it cannot turn into an env var; drop the same ones here so the
+			// panel never offers a card whose key save would hit a built-in id.
+			const builtinIds = new Set(this._providerCatalog.filter(p => !p.custom).map(p => p.id));
+			this._customProviderDefs = this._normalizeCustomProviders(arr).filter(def => !builtinIds.has(def.id));
+		} catch { this._customProviderDefs = []; }
+	}
+
+	private _normalizeCustomProviders(raw: unknown): CustomProviderDef[] {
+		if (!Array.isArray(raw)) { return []; }
+		const defs: CustomProviderDef[] = [];
+		const seen = new Set<string>();
+		for (const entry of raw as Array<Partial<CustomProviderDef>>) {
+			if (!entry || typeof entry !== 'object') { continue; }
+			const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+			// Same id rule Rust enforces (valid_custom_provider_id): a bad id would
+			// be silently ignored by the backend, leaving a card that cannot route.
+			if (!id || id.length > 64 || !/^[a-z0-9][a-z0-9._-]*$/.test(id) || seen.has(id)) { continue; }
+			seen.add(id);
+			defs.push({
+				id,
+				label: typeof entry.label === 'string' && entry.label.trim() ? entry.label.trim() : id,
+				protocol: entry.protocol === 'anthropic' ? 'anthropic' : 'openai',
+				baseUrl: typeof entry.baseUrl === 'string' ? entry.baseUrl.trim() : '',
+				auth: this._normalizeAuth(entry.auth),
+				...(Array.isArray(entry.models)
+					? { models: entry.models.filter((m): m is string => typeof m === 'string' && m.length > 0) }
+					: {}),
+			});
+		}
+		return defs;
+	}
+
+	private _normalizeAuth(auth: unknown): string {
+		return auth === 'x-api-key' || auth === 'api-key' || auth === 'none' ? auth : 'bearer';
+	}
+
+	/** Merge settings-defined providers into the render-only catalogue. */
+	private _mergeCustomProvidersIntoCatalog(): void {
+		// Remove synthetic entries from a previous merge first; then mark the
+		// ones Rust already merged as custom so this panel can identify them.
+		this._providerCatalog = this._providerCatalog.filter(p => !p.custom);
+		const byId = new Map(this._customProviderDefs.map(def => [def.id, def]));
+		for (const provider of this._providerCatalog) {
+			const def = byId.get(provider.id);
+			if (def) {
+				provider.custom = true;
+				provider.protocol = provider.protocol ?? def.protocol;
+				provider.authStyle = provider.authStyle ?? def.auth;
+			}
+		}
+		const known = new Set(this._providerCatalog.map(p => p.id));
+		for (const def of this._customProviderDefs) {
+			if (known.has(def.id)) { continue; }
+			this._providerCatalog.push({
+				id: def.id,
+				label: def.label,
+				defaultBaseUrl: def.baseUrl,
+				envVars: [],
+				consoleUrl: '',
+				keyless: def.auth === 'none',
+				custom: true,
+				protocol: def.protocol,
+				authStyle: def.auth,
+			});
+		}
+	}
+
+	private _renderCustomProvidersSection(container: HTMLElement): void {
+		container.innerHTML = '';
+		const section = document.createElement('div');
+
+		const title = document.createElement('div');
+		title.className = 'sidex-settings-section-title';
+		title.textContent = 'Custom Providers';
+		section.appendChild(title);
+
+		const desc = document.createElement('div');
+		desc.className = 'sidex-settings-row-description sidex-settings-section-desc';
+		desc.textContent = 'Use any OpenAI-compatible or Anthropic-compatible endpoint with its own base URL, auth style and key.';
+		section.appendChild(desc);
+
+		const list = document.createElement('div');
+		list.className = 'sidex-settings-card';
+		if (this._customProviderDefs.length === 0) {
+			const empty = document.createElement('div');
+			empty.className = 'sidex-settings-empty-state';
+			empty.textContent = 'No custom providers yet. Add an endpoint to use an API that does not ship with SideX.';
+			list.appendChild(empty);
+		} else {
+			for (const def of this._customProviderDefs) {
+				list.appendChild(this._buildCustomProviderRow(def));
+			}
+		}
+		section.appendChild(list);
+
+		if (this._customProviderFormOpen) {
+			section.appendChild(this._buildCustomProviderForm());
+		} else {
+			const actions = document.createElement('div');
+			actions.style.cssText = 'display:flex;justify-content:flex-end;margin:8px 20px 0;';
+			const addBtn = document.createElement('button');
+			addBtn.type = 'button';
+			addBtn.className = 'sidex-settings-btn';
+			addBtn.textContent = '+ Add Provider';
+			addBtn.addEventListener('click', () => {
+				this._customProviderFormOpen = true;
+				this._editingCustomProviderId = null;
+				this._renderCustomProvidersSection(container);
+			});
+			actions.appendChild(addBtn);
+			section.appendChild(actions);
+		}
+
+		container.appendChild(section);
+	}
+
+	private _buildCustomProviderRow(def: CustomProviderDef): HTMLElement {
+		const row = document.createElement('div');
+		row.className = 'sidex-settings-row';
+		row.style.alignItems = 'flex-start';
+
+		const infoCol = document.createElement('div');
+		infoCol.style.cssText = 'display:flex;flex-direction:column;min-width:0;flex:1;padding-right:16px;';
+
+		const label = document.createElement('div');
+		label.className = 'sidex-settings-row-label';
+		label.textContent = def.label;
+		infoCol.appendChild(label);
+
+		const url = document.createElement('div');
+		url.className = 'sidex-settings-row-description';
+		url.style.cssText = 'font-family:var(--monaco-monospace-font, monospace);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+		url.textContent = def.baseUrl;
+		url.title = def.baseUrl;
+		infoCol.appendChild(url);
+
+		const meta = document.createElement('div');
+		meta.className = 'sidex-settings-row-description';
+		meta.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;';
+		const appendPart = (text: string): HTMLSpanElement => {
+			if (meta.childNodes.length > 0) { meta.appendChild(document.createTextNode(' · ')); }
+			const part = document.createElement('span');
+			part.textContent = text;
+			meta.appendChild(part);
+			return part;
+		};
+		appendPart(PROTOCOL_LABELS[def.protocol] ?? def.protocol);
+		appendPart(AUTH_LABELS[def.auth] ?? def.auth);
+		const countEl = appendPart(this._formatModelCount(this._customModelCounts.get(def.id) ?? def.models?.length));
+		this._fillCustomModelCount(def, countEl);
+		const statusText = this._customProviderStatusText(def);
+		const statusEl = appendPart(statusText);
+		if (statusText === 'Key required') {
+			statusEl.style.color = 'var(--vscode-editorWarning-foreground, #cca700)';
+		} else if (statusText !== 'Disabled') {
+			statusEl.style.color = 'var(--vscode-testing-iconPassed, #89d185)';
+		}
+		infoCol.appendChild(meta);
+
+		const resultEl = document.createElement('div');
+		resultEl.className = 'sidex-settings-row-description';
+		resultEl.style.cssText = 'display:none;';
+		infoCol.appendChild(resultEl);
+
+		row.appendChild(infoCol);
+
+		const actions = document.createElement('div');
+		actions.className = 'sidex-settings-row-action';
+		actions.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end;';
+
+		const testBtn = this._buildRowButton('Test connection');
+		testBtn.addEventListener('click', () => { void this._testCustomProvider(def, testBtn, resultEl); });
+		actions.appendChild(testBtn);
+
+		const editBtn = this._buildRowButton('Edit');
+		editBtn.addEventListener('click', () => {
+			this._customProviderFormOpen = true;
+			this._editingCustomProviderId = def.id;
+			if (this._customProvidersContainer) { this._renderCustomProvidersSection(this._customProvidersContainer); }
+		});
+		actions.appendChild(editBtn);
+
+		const deleteBtn = this._buildRowButton('Delete');
+		deleteBtn.addEventListener('click', () => { void this._deleteCustomProvider(def); });
+		actions.appendChild(deleteBtn);
+
+		row.appendChild(actions);
+		return row;
+	}
+
+	private _buildRowButton(label: string): HTMLButtonElement {
+		const button = document.createElement('button');
+		button.type = 'button';
+		button.className = 'sidex-settings-btn';
+		button.textContent = label;
+		return button;
+	}
+
+	private _formatModelCount(count: number | undefined): string {
+		if (typeof count !== 'number' || Number.isNaN(count)) { return 'Model count unknown'; }
+		return `${count} model${count === 1 ? '' : 's'}`;
+	}
+
+	/** Best-effort live model count for a custom provider; declared models are the fallback. */
+	private _fillCustomModelCount(def: CustomProviderDef, el: HTMLElement): void {
+		if (this._customModelCounts.has(def.id) || !this._invoke) { return; }
+		void this._invoke('providers_list_models', { provider: def.id }).then(models => {
+			if (!Array.isArray(models)) { return; }
+			this._customModelCounts.set(def.id, models.length);
+			if (el.isConnected) { el.textContent = this._formatModelCount(models.length); }
+		}).catch(() => { /* keep the declared count / unknown */ });
+	}
+
+	private _customProviderStatusText(def: CustomProviderDef): string {
+		const status = this._providerStatus.get(def.id);
+		if (status && status.enabled === false) { return 'Disabled'; }
+		if (def.auth === 'none') { return 'No key needed'; }
+		if (status?.source === 'env') { return 'Configured via environment'; }
+		if (this._hasStoredKey(status)) { return 'Key set'; }
+		if (status?.configured) { return 'Configured via environment'; }
+		return 'Key required';
+	}
+
+	private _buildCustomProviderForm(): HTMLElement {
+		const form = document.createElement('div');
+		form.className = 'sidex-settings-card';
+		form.style.cssText = 'margin-top:8px;padding:14px 20px;display:flex;flex-direction:column;gap:10px;';
+
+		const editing = this._editingCustomProviderId
+			? this._customProviderDefs.find(def => def.id === this._editingCustomProviderId)
+			: undefined;
+
+		const wrapInput = (placeholder: string, value: string, readOnly = false): HTMLInputElement => {
+			const wrapper = document.createElement('div');
+			wrapper.className = 'sidex-input-wrapper';
+			wrapper.style.cssText = 'max-width:none;width:100%;';
+			const input = document.createElement('input');
+			input.type = 'text';
+			input.placeholder = placeholder;
+			input.value = value;
+			if (readOnly) {
+				input.readOnly = true;
+				input.style.opacity = '0.7';
+			}
+			wrapper.appendChild(input);
+			return input;
+		};
+
+		const controlOf = (input: HTMLInputElement): HTMLElement => input.parentElement as HTMLElement;
+
+		const nameInput = wrapInput('My provider', editing?.label ?? '');
+		const nameControl = controlOf(nameInput);
+		const idInput = wrapInput('lowercase-id', editing?.id ?? '', !!editing);
+		const idControl = controlOf(idInput);
+		const urlInput = wrapInput('https://your-host/v1', editing?.baseUrl ?? '');
+		const urlControl = controlOf(urlInput);
+		const modelsInput = wrapInput('e.g. gpt-4.1, claude-sonnet-4.6', editing?.models?.join(', ') ?? '');
+		const modelsControl = controlOf(modelsInput);
+
+		let protocol = editing?.protocol ?? 'openai';
+		let auth = editing?.auth ?? 'bearer';
+
+		const fullWidth = (dropdown: HTMLElement): HTMLElement => {
+			dropdown.style.width = '100%';
+			const trigger = dropdown.querySelector('.sidex-custom-select-trigger') as HTMLElement | null;
+			if (trigger) { trigger.style.width = '100%'; }
+			return dropdown;
+		};
+		const protocolControl = fullWidth(this._boundedDropdown(
+			[{ value: 'openai', label: 'OpenAI-compatible' }, { value: 'anthropic', label: 'Anthropic-compatible' }],
+			protocol,
+			value => { protocol = value; }));
+		const authControl = fullWidth(this._boundedDropdown(
+			[
+				{ value: 'bearer', label: 'Bearer token' },
+				{ value: 'x-api-key', label: 'x-api-key header' },
+				{ value: 'api-key', label: 'api-key header' },
+				{ value: 'none', label: 'No key' },
+			],
+			auth,
+			value => { auth = value; }));
+
+		const slugify = (value: string): string => value.trim().toLowerCase()
+			.replace(/[^a-z0-9._-]+/g, '-')
+			.replace(/^-+|-+$/g, '');
+		let idTouched = !!editing;
+		nameInput.addEventListener('input', () => {
+			if (!idTouched) { idInput.value = slugify(nameInput.value); }
+		});
+		idInput.addEventListener('input', () => { idTouched = true; });
+
+		const errorEl = document.createElement('div');
+		errorEl.className = 'sidex-settings-row-description';
+		errorEl.style.cssText = 'display:none;color:var(--vscode-editorError-foreground, #f85149);';
+		const fail = (message: string): void => {
+			errorEl.textContent = message;
+			errorEl.style.display = '';
+		};
+
+		form.appendChild(this._buildCustomFormRow('Display name', nameControl));
+		form.appendChild(this._buildCustomFormRow('Provider ID', idControl));
+		form.appendChild(this._buildCustomFormRow('Protocol', protocolControl));
+		form.appendChild(this._buildCustomFormRow('Base URL', urlControl));
+		form.appendChild(this._buildCustomFormRow('Auth', authControl));
+		form.appendChild(this._buildCustomFormRow('Models (comma separated, optional)', modelsControl));
+		form.appendChild(errorEl);
+
+		const buttons = document.createElement('div');
+		buttons.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;padding-top:2px;';
+
+		const cancelBtn = document.createElement('button');
+		cancelBtn.type = 'button';
+		cancelBtn.className = 'sidex-settings-btn';
+		cancelBtn.textContent = 'Cancel';
+		cancelBtn.addEventListener('click', () => {
+			this._customProviderFormOpen = false;
+			this._editingCustomProviderId = null;
+			if (this._customProvidersContainer) { this._renderCustomProvidersSection(this._customProvidersContainer); }
+		});
+		buttons.appendChild(cancelBtn);
+
+		const saveBtn = document.createElement('button');
+		saveBtn.type = 'button';
+		saveBtn.className = 'sidex-settings-btn sidex-settings-btn-primary';
+		saveBtn.textContent = editing ? 'Save changes' : 'Add provider';
+		saveBtn.addEventListener('click', () => {
+			void (async () => {
+				errorEl.style.display = 'none';
+				const displayName = nameInput.value.trim();
+				const id = idInput.value.trim();
+				const baseUrl = urlInput.value.trim();
+				const models = modelsInput.value.split(',').map(m => m.trim()).filter(Boolean);
+				if (!displayName) { return fail('A display name is required.'); }
+				if (!id) { return fail('A provider ID is required.'); }
+				if (!/^[a-z0-9][a-z0-9._-]*$/.test(id)) {
+					return fail('Provider ID may only contain lowercase letters, digits, dots, dashes and underscores.');
+				}
+				if (!/^https?:\/\/\S+$/i.test(baseUrl)) {
+					return fail('A base URL starting with http:// or https:// is required.');
+				}
+				if (id.length > 64) {
+					return fail('Provider ID is too long (max 64 characters).');
+				}
+				const editedId = this._editingCustomProviderId;
+				if (id !== editedId && this._customProviderDefs.some(def => def.id === id)) {
+					return fail(`Provider ID "${id}" is already in use.`);
+				}
+				if (id !== editedId && this._providerCatalog.some(provider => provider.id === id && !provider.custom)) {
+					return fail(`Provider ID "${id}" is reserved by a built-in provider.`);
+				}
+				const def: CustomProviderDef = { id, label: displayName, protocol, baseUrl, auth };
+				if (models.length > 0) { def.models = models; }
+
+				const defs = [...this._customProviderDefs];
+				const index = editedId ? defs.findIndex(entry => entry.id === editedId) : -1;
+				if (index >= 0) { defs[index] = def; } else { defs.push(def); }
+
+				saveBtn.disabled = true;
+				this._customProviderFormOpen = false;
+				this._editingCustomProviderId = null;
+				const error = await this._persistCustomProviders(defs);
+				saveBtn.disabled = false;
+				if (error) {
+					this._customProviderFormOpen = true;
+					this._editingCustomProviderId = editedId;
+					fail(error);
+				}
+			})();
+		});
+		buttons.appendChild(saveBtn);
+		form.appendChild(buttons);
+
+		return form;
+	}
+
+	private _buildCustomFormRow(labelText: string, control: HTMLElement): HTMLElement {
+		const row = document.createElement('div');
+		row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:16px;';
+		const label = document.createElement('div');
+		label.className = 'sidex-settings-row-label';
+		label.textContent = labelText;
+		row.appendChild(label);
+		const controlWrap = document.createElement('div');
+		controlWrap.style.cssText = 'width:300px;max-width:55%;flex-shrink:0;';
+		controlWrap.appendChild(control);
+		row.appendChild(controlWrap);
+		return row;
+	}
+
+	private async _persistCustomProviders(defs: CustomProviderDef[]): Promise<string | null> {
+		if (!this._invoke) { return 'Settings are unavailable.'; }
+		try {
+			await this._invoke('settings_update', { key: 'sidex.providers.custom', value: defs, scope: 'user' });
+		} catch (e) {
+			return e instanceof Error ? e.message : String(e);
+		}
+		this._customProviderDefs = defs;
+		this._customModelCounts.clear();
+		this._mergeCustomProvidersIntoCatalog();
+		if (this._customProvidersContainer) { this._renderCustomProvidersSection(this._customProvidersContainer); }
+		// The server reads the provider list from its environment at spawn time.
+		await this._applyCredentialChange();
+		return null;
+	}
+
+	private async _testCustomProvider(def: CustomProviderDef, button: HTMLButtonElement, resultEl: HTMLElement): Promise<void> {
+		if (!this._invoke) { return; }
+		button.disabled = true;
+		resultEl.style.display = '';
+		resultEl.style.color = '';
+		resultEl.textContent = 'Testing…';
+		try {
+			const result = await this._invoke('providers_test', { provider: def.id }) as ProviderTestResult;
+			if (result?.ok) {
+				const parts: string[] = [];
+				if (typeof result.status === 'number') { parts.push(`HTTP ${result.status}`); }
+				if (typeof result.latencyMs === 'number') { parts.push(`${Math.round(result.latencyMs)} ms`); }
+				if (typeof result.modelCount === 'number') { parts.push(this._formatModelCount(result.modelCount)); }
+				resultEl.textContent = `✓ ${parts.length > 0 ? parts.join(' · ') : 'Connected'}${result.message ? ` — ${result.message}` : ''}`;
+				resultEl.style.color = 'var(--vscode-testing-iconPassed, #89d185)';
+				if (typeof result.modelCount === 'number') { this._customModelCounts.set(def.id, result.modelCount); }
+			} else {
+				const detail = result?.message
+					|| (typeof result?.status === 'number' ? `HTTP ${result.status}` : 'Connection failed');
+				resultEl.textContent = `✗ ${detail}`;
+				resultEl.style.color = 'var(--vscode-editorError-foreground, #f85149)';
+			}
+		} catch (e) {
+			resultEl.textContent = `✗ ${e instanceof Error ? e.message : String(e)}`;
+			resultEl.style.color = 'var(--vscode-editorError-foreground, #f85149)';
+		} finally {
+			button.disabled = false;
+		}
+	}
+
+	private async _deleteCustomProvider(def: CustomProviderDef): Promise<void> {
+		const confirmed = await showConfirmDialog({
+			title: `Delete custom provider ${def.label}?`,
+			body: [
+				`SideX will stop using the "${def.label}" endpoint and forget its API key.`,
+				`Models declared by "${def.label}" stay in the model list but will stop working until another provider serves them.`,
+			],
+			confirmLabel: 'Delete',
+			danger: true,
+		});
+		if (!confirmed) { return; }
+		const defs = this._customProviderDefs.filter(entry => entry.id !== def.id);
+		const error = await this._persistCustomProviders(defs);
+		if (error) {
+			console.error('Failed to delete custom provider:', error);
+			return;
+		}
+		// Best effort: clear the key/off-switch slots the card may have created.
+		if (this._invoke) { this._invoke('providers_delete', { provider: def.id }).catch(() => { /* already gone */ }); }
 	}
 
 	/**
@@ -866,21 +1471,42 @@ export class ModelsSection implements SettingsSection {
 		}
 	}
 
+	/** True when the backend holds a stored (typed) API key for this provider. */
+	private _hasStoredKey(status: ProviderStatusInfo | undefined): boolean {
+		if (!status) { return false; }
+		if (typeof status.hasKey === 'boolean') {
+			// `hasKey` also counts an environment variable, which the Clear
+			// button cannot remove — leave those editable so a typed key can
+			// override the environment instead.
+			return status.hasKey && status.source !== 'env';
+		}
+		// Backend without the new `hasKey` field: a settings-sourced credential
+		// is a stored key (env/loopback credentials are not ours to clear).
+		return status.configured && status.source === 'settings';
+	}
+
 	/**
-	 * Save whatever changed on a provider card. Returns a user-facing message
-	 * on failure — a rejected key, a malformed base URL, or (for a provider
-	 * with no shipped default) no URL at all — so the card that caused it can
-	 * show the message inline instead of the failure disappearing into the
-	 * console. Returns `null` on success or when there was nothing to save.
+	 * Save a provider card. `action` follows the Rust contract: `keep` leaves
+	 * the stored key alone (so editing a base URL can never silently destroy
+	 * it), `set` stores the typed key and `clear` removes it. Returns a
+	 * user-facing message on failure so the card can show it inline, or
+	 * `null` on success / when there was nothing to save.
 	 */
-	private async _saveProviderKey(config: ProviderCatalogEntry, inputs: Map<string, HTMLInputElement>): Promise<string | null> {
+	private async _saveProviderKey(config: ProviderCatalogEntry, inputs: Map<string, HTMLInputElement>, action: ApiKeyAction = 'keep'): Promise<string | null> {
 		if (!this._invoke) { return null; }
 		const apiKeyInput = inputs.get('apiKey');
-		// A disabled field is showing the masked placeholder, not a real
-		// value — never forward that as the key to save.
-		const apiKey = apiKeyInput && !apiKeyInput.disabled ? apiKeyInput.value.trim() || null : null;
-		const baseUrl = inputs.get('baseUrl')?.value.trim() || null;
-		if (!apiKey && !baseUrl) { return null; }
+		// A read-only field is showing the masked placeholder, not a real value.
+		// An empty key field means "leave the stored key alone" — only the Clear
+		// action removes a key.
+		const typedKey = apiKeyInput && !apiKeyInput.readOnly && apiKeyInput.value !== MASKED_KEY
+			? apiKeyInput.value.trim()
+			: '';
+		const apiKey = typedKey || null;
+		// Custom endpoints come from `sidex.providers.custom`; the Rust resolver
+		// ignores a per-provider base-URL override for them, so don't write one.
+		const baseUrl = config.custom ? null : (inputs.get('baseUrl')?.value.trim() || null);
+		const apiKeyAction: ApiKeyAction = action === 'clear' ? 'clear' : (apiKey ? 'set' : 'keep');
+		if (apiKeyAction === 'keep' && !baseUrl) { return null; }
 
 		// A provider that ships with no default base URL has nowhere to fall
 		// back to — an empty base URL would resolve to "" on the Rust side and
@@ -891,12 +1517,78 @@ export class ModelsSection implements SettingsSection {
 		}
 
 		try {
-			await this._invoke('providers_save', { provider: config.id, apiKey, baseUrl });
+			await this._invoke('providers_save', { provider: config.id, apiKey, baseUrl, apiKeyAction });
 		} catch (e) {
 			return e instanceof Error ? e.message : String(e);
 		}
 		await this._applyCredentialChange();
 		return null;
+	}
+
+	/** Explicit "forget this key" action; keeps the configured endpoint intact. */
+	private async _clearProviderKey(config: ProviderCatalogEntry): Promise<string | null> {
+		if (!this._invoke) { return null; }
+		const status = this._providerStatus.get(config.id);
+		const baseUrl = status?.baseUrl && status.baseUrl !== config.defaultBaseUrl ? status.baseUrl : null;
+		try {
+			await this._invoke('providers_save', { provider: config.id, apiKey: null, baseUrl, apiKeyAction: 'clear' });
+		} catch (e) {
+			return e instanceof Error ? e.message : String(e);
+		}
+		await this._applyCredentialChange();
+		return null;
+	}
+
+	/**
+	 * Replace / Clear buttons shown next to a masked key field. The field used
+	 * to be disabled once a key was stored, which left the user with no way to
+	 * rotate or remove it.
+	 */
+	private _buildKeyActionsRow(config: ProviderCatalogEntry, input: HTMLInputElement, errorEl: HTMLElement): HTMLElement {
+		const actions = document.createElement('div');
+		actions.style.cssText = 'display:flex;align-items:center;gap:6px;';
+
+		const replaceBtn = document.createElement('button');
+		replaceBtn.type = 'button';
+		replaceBtn.className = 'sidex-settings-btn';
+		replaceBtn.textContent = 'Replace';
+		replaceBtn.addEventListener('click', () => {
+			input.readOnly = false;
+			input.value = '';
+			input.placeholder = `Enter your ${config.label} API Key`;
+			input.focus();
+			actions.style.display = 'none';
+		});
+
+		// Leaving the field empty without saving restores the mask and the
+		// actions, so a stray click on Replace doesn't look like the key is gone.
+		input.addEventListener('blur', () => {
+			if (input.readOnly || input.value.trim()) { return; }
+			input.value = MASKED_KEY;
+			input.readOnly = true;
+			actions.style.display = '';
+		});
+
+		const clearBtn = document.createElement('button');
+		clearBtn.type = 'button';
+		clearBtn.className = 'sidex-settings-btn';
+		clearBtn.textContent = 'Clear';
+		clearBtn.addEventListener('click', () => {
+			void (async () => {
+				clearBtn.disabled = true;
+				errorEl.style.display = 'none';
+				const error = await this._clearProviderKey(config);
+				if (error) {
+					errorEl.textContent = error;
+					errorEl.style.display = '';
+					clearBtn.disabled = false;
+				}
+			})();
+		});
+
+		actions.appendChild(replaceBtn);
+		actions.appendChild(clearBtn);
+		return actions;
 	}
 
 	/**
@@ -927,6 +1619,7 @@ export class ModelsSection implements SettingsSection {
 			await restartServer();
 		} catch { /* the chat panel surfaces the disconnected state on its own */ }
 		await this._refreshProviderStatus();
+		if (this._customProvidersContainer) { this._renderCustomProvidersSection(this._customProvidersContainer); }
 		if (this._apiKeysContainer) { this._renderApiKeysSection(this._apiKeysContainer); }
 		if (this._discoveryContainer) { await this._renderDiscoverySection(this._discoveryContainer); }
 
@@ -1058,5 +1751,6 @@ export class ModelsSection implements SettingsSection {
 
 	dispose(): void {
 		this._container = null;
+		this._customProvidersContainer = null;
 	}
 }

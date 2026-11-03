@@ -29,6 +29,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::commands::providers;
 use crate::commands::secrets::SecretsStore;
+use crate::commands::settings::SettingsStore;
 
 /// How long to wait for the server to answer `/v1/health` before giving up.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -223,9 +224,24 @@ fn free_port() -> Result<u16, String> {
 /// Order matters: a bundled sidecar is what ships to users, `SIDEX_SERVER_BIN`
 /// and `PATH` let people run their own build, and the repo-relative paths keep
 /// `tauri dev` working without an install step.
+///
+/// `bundle.resources` can place the sidecar either at the resource root or
+/// under a `resources/` subdirectory, and some installers run the executable
+/// from the directory the sidecar was copied next to. All four bundled
+/// locations are checked (in that order) before any user-supplied build.
 fn find_server_binary(app: &AppHandle) -> Option<PathBuf> {
+    let mut bundled_candidates: Vec<PathBuf> = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
-        let bundled = resource_dir.join(SERVER_BIN);
+        bundled_candidates.push(resource_dir.join(SERVER_BIN));
+        bundled_candidates.push(resource_dir.join("resources").join(SERVER_BIN));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            bundled_candidates.push(dir.join(SERVER_BIN));
+            bundled_candidates.push(dir.join("resources").join(SERVER_BIN));
+        }
+    }
+    for bundled in bundled_candidates {
         if bundled.is_file() {
             return Some(bundled);
         }
@@ -568,7 +584,8 @@ fn start(app: &AppHandle, server: &Arc<LocalServer>) {
 
     let provider_env = {
         let store = app.state::<Arc<SecretsStore>>();
-        providers::server_env(&store)
+        let settings = app.state::<Arc<SettingsStore>>();
+        providers::server_env(&store, &settings)
     };
 
     let generation = server.bump_generation();

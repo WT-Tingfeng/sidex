@@ -247,7 +247,7 @@ func (c *Client) streamBedrock(
 	endpoint := "https://bedrock-runtime." + region + ".amazonaws.com" +
 		"/model/" + modelPath + "/invoke-with-response-stream"
 
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(streamContext(opts), "POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}

@@ -92,6 +92,17 @@ func AnthropicModelID(modelID string) string {
 	return strings.ReplaceAll(id, ".", "-")
 }
 
+// anthropicModelName maps the client's model id to what the endpoint expects.
+// The first-party API wants Anthropic's dash spelling; a custom
+// Anthropic-compatible endpoint is given the configured id verbatim (minus any
+// provider prefix) so it can match its own catalog.
+func (c *Client) anthropicModelName() string {
+	if c.provider == "anthropic" {
+		return AnthropicModelID(c.model)
+	}
+	return DirectModelID(c.model)
+}
+
 // ---------------------------------------------------------------------------
 // Request shape
 // ---------------------------------------------------------------------------
@@ -341,7 +352,7 @@ func (c *Client) streamAnthropic(
 		tools = filterSubscriptionTools(tools)
 	}
 	body := anthropicRequest{
-		Model:     AnthropicModelID(c.model),
+		Model:     c.anthropicModelName(),
 		MaxTokens: maxTokens,
 		Messages:  msgs,
 		Tools:     buildAnthropicTools(tools),
@@ -361,23 +372,31 @@ func (c *Client) streamAnthropic(
 	}
 
 	url := c.baseURL + "/messages"
-	if c.authMode == AuthModeOAuth {
+	if c.provider == "anthropic" && c.authMode == AuthModeOAuth {
 		url += "?beta=true"
 	}
-	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(streamContext(opts), "POST", url, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", anthropicVersion)
-	if c.authMode == AuthModeOAuth {
+	switch {
+	case c.provider == "anthropic" && c.authMode == AuthModeOAuth:
 		sessionID := ""
 		if opts != nil {
 			sessionID = opts.SessionID
 		}
 		applyClaudeCodeIdentity(req, c.apiKey, sessionID)
-	} else {
-		req.Header.Set("x-api-key", c.apiKey)
+	case c.authStyle != "":
+		// Custom provider: the desktop app declared the auth header style.
+		applyAuthStyle(req, c.authStyle, c.apiKey)
+	case c.provider == "anthropic":
+		if c.apiKey != "" {
+			req.Header.Set("x-api-key", c.apiKey)
+		}
+	default:
+		applyAuthStyle(req, AuthStyleBearer, c.apiKey)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -453,10 +472,11 @@ func parseAnthropicSSE(r io.Reader, onChunk func(StreamChunk)) error {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		// Tolerate proxies that emit "data:{...}" without the spec space.
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "" || data == "[DONE]" {
 			continue
 		}

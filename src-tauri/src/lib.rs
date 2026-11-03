@@ -785,6 +785,7 @@ pub fn run() {
             commands::providers_detect_cli,
             commands::providers_detect_local,
             commands::providers_list_models,
+            commands::providers_test,
             commands::accounts_list,
             commands::accounts_connect,
             commands::accounts_disconnect,

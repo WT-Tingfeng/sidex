@@ -624,6 +624,14 @@ export class ChatInput extends Component {
 		this._stopBtn = DOM.append(right, $('button.sc-stop-btn'));
 		this._stopBtn.title = 'Stop';
 		this._stopBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M5 4C4.44772 4 4 4.44772 4 5V9C4 9.5523 4.44772 10 5 10H9C9.5523 10 10 9.5523 10 9V5C10 4.44772 9.5523 4 9 4H5ZM0 7C0 3.13401 3.13401 0 7 0C10.866 0 14 3.13401 14 7C14 10.866 10.866 14 7 14C3.13401 14 0 10.866 0 7Z"/></svg>';
+		// Stop must abort the turn on the server, not only hide the spinner: the
+		// view forwards this to SidexChatService.stopStreaming(), which sends the
+		// protocol cancel frame before clearing local streaming state.
+		this.on(this._stopBtn, 'click', (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			this._onStop.fire();
+		});
 		this._stopBtn.style.display = 'none';
 
 		// Initialize mention system

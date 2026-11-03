@@ -23,13 +23,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::commands::secrets::SecretsStore;
+use crate::commands::settings::SettingsStore;
 
 /// Where a resolved credential came from. Surfaced in the UI so the user can
 /// see *why* a provider is working without revealing the key itself.
@@ -41,6 +42,17 @@ pub const SOURCE_LOCAL: &str = "local";
 /// Credential kinds. A console key and a CLI login are sent differently.
 pub const AUTH_API_KEY: &str = "api_key";
 pub const AUTH_OAUTH: &str = "oauth";
+/// No credential at all: a loopback model server, or a custom endpoint the
+/// user explicitly configured with `auth: "none"`.
+pub const AUTH_NONE: &str = "none";
+
+/// Protocol ids used by `sidex.providers.custom` and reported to the UI.
+pub const PROTOCOL_OPENAI: &str = "openai";
+pub const PROTOCOL_ANTHROPIC: &str = "anthropic";
+
+/// Settings key holding the user's own provider endpoints: a JSON array of
+/// objects shaped like `{"id", "label", "protocol", "baseUrl", "auth", "models"}`.
+const CUSTOM_PROVIDERS_KEY: &str = "sidex.providers.custom";
 
 /// Anthropic rejects every REST call, key or OAuth alike, that omits this --
 /// proven against the live API: `curl .../v1/models -H "Authorization: Bearer
@@ -78,6 +90,27 @@ fn api_key_slot(provider: &str) -> String {
 /// Secret-store key for a provider's base-URL override.
 fn base_url_slot(provider: &str) -> String {
     format!("sidex.baseurl.{provider}")
+}
+
+/// Environment-variable form of a provider id: uppercase, with every rune that
+/// is not ASCII alphanumeric collapsed to `_`.
+///
+/// The Go server applies the identical transformation when it reads
+/// `SIDEX_PROVIDER_<ID>_*` (`envProviderVar` in
+/// internal/ai/localproviders.go). The two sides have to agree: a provider id
+/// is a user-chosen slug and may contain `.`, `-` or `_`, none of which can
+/// appear verbatim in a shell variable name.
+fn env_provider_name(provider: &str) -> String {
+    provider
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Secret-store key for the per-provider "reuse my CLI login" opt-in.
@@ -350,12 +383,216 @@ fn provider_info(id: &str) -> Option<&'static ProviderInfo> {
     PROVIDERS.iter().find(|p| p.id == id)
 }
 
+/// One user-defined provider endpoint, as stored under
+/// `sidex.providers.custom`.
+///
+/// The settings layer owns this list; no slot is written for it. The API key
+/// still goes through the secret store (`sidex.apikey.<id>`), so it never
+/// lands in `settings.json`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CustomProvider {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default = "default_custom_protocol")]
+    protocol: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default = "default_custom_auth_style")]
+    auth: String,
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+fn default_custom_protocol() -> String {
+    PROTOCOL_OPENAI.to_string()
+}
+
+fn default_custom_auth_style() -> String {
+    "bearer".to_string()
+}
+
+impl CustomProvider {
+    /// Display name: the label the user gave it, otherwise its id.
+    fn label(&self) -> &str {
+        let label = self.label.trim();
+        if label.is_empty() {
+            &self.id
+        } else {
+            label
+        }
+    }
+
+    /// `anthropic` only when explicitly selected; anything else is treated as
+    /// OpenAI-compatible so a bad value can never produce a protocol the
+    /// server cannot route.
+    fn protocol(&self) -> &str {
+        if self.protocol == PROTOCOL_ANTHROPIC {
+            PROTOCOL_ANTHROPIC
+        } else {
+            PROTOCOL_OPENAI
+        }
+    }
+
+    /// Header scheme the endpoint expects. Unknown values fall back to the
+    /// OpenAI-compatible convention rather than failing the whole entry.
+    fn auth_style(&self) -> &str {
+        match self.auth.as_str() {
+            "x-api-key" => "x-api-key",
+            "api-key" => "api-key",
+            AUTH_NONE => AUTH_NONE,
+            _ => "bearer",
+        }
+    }
+
+    fn is_keyless(&self) -> bool {
+        self.auth_style() == AUTH_NONE
+    }
+
+    fn base_url(&self) -> String {
+        normalize_base_url(&self.base_url)
+    }
+}
+
+fn normalize_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// Provider ids are user-chosen slugs: they become a model id prefix and,
+/// after `env_provider_name`, part of environment variable names. This is the
+/// Settings UI's rule (`^[a-z0-9][a-z0-9._-]*$`) verbatim, so an id the form
+/// accepts is never silently dropped by the backend.
+fn valid_custom_provider_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    chars.all(|c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_'
+    })
+}
+
+/// The user-defined providers, filtered down to the entries that have an id
+/// safe to turn into environment variables and that do not shadow a built-in
+/// provider. An entry with no base URL is kept: it shows up in the catalog as
+/// "not configured yet", which is the state a half-filled form is in.
+fn custom_providers(settings: &SettingsStore) -> Vec<CustomProvider> {
+    let Ok(guard) = settings.inner.read() else {
+        return Vec::new();
+    };
+    let Some(value) = guard.get_raw(CUSTOM_PROVIDERS_KEY) else {
+        return Vec::new();
+    };
+    let list: Vec<CustomProvider> = match serde_json::from_value(value.clone()) {
+        Ok(list) => list,
+        Err(e) => {
+            log::warn!("ignoring {CUSTOM_PROVIDERS_KEY}: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(list.len());
+    for provider in list {
+        let id = provider.id.trim().to_string();
+        if id != provider.id || !valid_custom_provider_id(&id) {
+            log::warn!("ignoring custom provider with invalid id {:?}", provider.id);
+            continue;
+        }
+        if provider_info(&id).is_some() {
+            log::warn!("ignoring custom provider {id:?}: it shadows a built-in provider");
+            continue;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        out.push(provider);
+    }
+    out
+}
+
+fn custom_provider<'a>(custom: &'a [CustomProvider], id: &str) -> Option<&'a CustomProvider> {
+    custom.iter().find(|p| p.id == id)
+}
+
+fn builtin_protocol(id: &str) -> &'static str {
+    match id {
+        "anthropic" => PROTOCOL_ANTHROPIC,
+        "bedrock" => "bedrock",
+        _ => PROTOCOL_OPENAI,
+    }
+}
+
+fn builtin_auth_style(id: &str, keyless: bool) -> &'static str {
+    if keyless {
+        AUTH_NONE
+    } else if id == "anthropic" {
+        "x-api-key"
+    } else {
+        "bearer"
+    }
+}
+
 /// Providers that are OpenAI-compatible servers on loopback, in probe order.
 const LOCAL_PROVIDERS: &[&str] = &["ollama", "lmstudio", "llamacpp", "vllm"];
 
+/// One provider as the Settings UI sees it: a built-in entry from
+/// `PROVIDERS`, or one of the user's own endpoints.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCatalogEntry {
+    pub id: String,
+    pub label: String,
+    pub default_base_url: String,
+    pub env_vars: Vec<String>,
+    pub console_url: String,
+    pub keyless: bool,
+    /// True for an entry that came from `sidex.providers.custom`.
+    pub custom: bool,
+    /// `openai` or `anthropic` (built-in `bedrock` reports its own name).
+    pub protocol: String,
+    /// Header scheme the provider expects: bearer/x-api-key/api-key/none.
+    pub auth_style: String,
+}
+
+fn builtin_catalog_entry(info: &ProviderInfo) -> ProviderCatalogEntry {
+    ProviderCatalogEntry {
+        id: info.id.to_string(),
+        label: info.label.to_string(),
+        default_base_url: info.default_base_url.to_string(),
+        env_vars: info.env_vars.iter().map(|v| (*v).to_string()).collect(),
+        console_url: info.console_url.to_string(),
+        keyless: info.keyless,
+        custom: false,
+        protocol: builtin_protocol(info.id).to_string(),
+        auth_style: builtin_auth_style(info.id, info.keyless).to_string(),
+    }
+}
+
+/// Every provider SideX knows how to talk to: the built-in catalog first, then
+/// whatever the user added under `sidex.providers.custom`.
 #[tauri::command]
-pub fn providers_catalog() -> Vec<ProviderInfo> {
-    PROVIDERS.to_vec()
+pub fn providers_catalog(settings: State<'_, Arc<SettingsStore>>) -> Vec<ProviderCatalogEntry> {
+    let mut entries: Vec<ProviderCatalogEntry> =
+        PROVIDERS.iter().map(builtin_catalog_entry).collect();
+    for provider in custom_providers(&settings) {
+        entries.push(ProviderCatalogEntry {
+            id: provider.id.clone(),
+            label: provider.label().to_string(),
+            default_base_url: provider.base_url(),
+            env_vars: Vec::new(),
+            console_url: String::new(),
+            keyless: provider.is_keyless(),
+            custom: true,
+            protocol: provider.protocol().to_string(),
+            auth_style: provider.auth_style().to_string(),
+        });
+    }
+    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +618,43 @@ pub struct ProviderStatus {
     /// `providers_set_enabled`. Drives the settings toggle; `configured`
     /// drives whether the provider can actually be used.
     pub enabled: bool,
+    /// True when an API key is resolvable for this provider right now. A
+    /// boolean only -- the value itself never leaves the secret store. Unlike
+    /// `configured`, this stays true for a provider whose base URL is still
+    /// missing, so the UI can show "key saved, URL needed" instead of
+    /// offering an empty key field that would overwrite it.
+    pub has_key: bool,
+    /// True for a user-defined provider from `sidex.providers.custom`.
+    pub custom: bool,
+    /// `openai` or `anthropic` (built-in `bedrock` reports its own name).
+    pub protocol: String,
+    /// Header scheme the provider expects: bearer/x-api-key/api-key/none.
+    pub auth_style: String,
+}
+
+/// True when an API key is stored or present in the environment for this
+/// provider, independent of whether the rest of the configuration resolves.
+///
+/// The UI needs this separately from `configured`: a custom provider whose
+/// base URL has not been filled in yet has a saved key but does not resolve,
+/// and offering an empty key field in that state would overwrite it.
+fn provider_has_key(store: &SecretsStore, id: &str) -> bool {
+    if let Ok(Some(key)) = store.inner.get(&api_key_slot(id)) {
+        if !key.trim().is_empty() {
+            return true;
+        }
+    }
+    if let Some(info) = provider_info(id) {
+        info.env_vars
+            .iter()
+            .any(|var| std::env::var(var).is_ok_and(|s| !s.trim().is_empty()))
+    } else {
+        std::env::var(format!(
+            "SIDEX_PROVIDER_{}_KEY",
+            env_provider_name(id)
+        ))
+        .is_ok_and(|s| !s.trim().is_empty())
+    }
 }
 
 /// A credential ready to be handed to the model server. The key is only ever
@@ -409,34 +683,61 @@ pub struct ResolvedProvider {
 /// drop a connected Claude login, and connecting Claude must not flip the key
 /// row on. A typed/env key still wins when that row is on, so billed keys are
 /// never silently replaced by a subscription token.
-fn resolve_inner(store: &SecretsStore, id: &str) -> Option<ResolvedProvider> {
+fn resolve_inner(
+    store: &SecretsStore,
+    custom: &[CustomProvider],
+    id: &str,
+) -> Option<ResolvedProvider> {
     if !provider_disabled(store, id) {
-        if let Some(resolved) = resolve_direct_credential(store, id) {
+        if let Some(resolved) = resolve_direct_credential(store, custom, id) {
             return Some(resolved);
         }
     }
-    resolve_cli_credential(store, id)
+    resolve_cli_credential(store, custom, id)
 }
 
 /// Settings / env / keyless resolution, deaf to the off switch. Used by
 /// `providers_status` so the API Keys row still shows the typed key while
 /// the toggle is off — not a CLI login, which has its own Connect row.
-fn resolve_ignoring_enabled(store: &SecretsStore, id: &str) -> Option<ResolvedProvider> {
-    resolve_direct_credential(store, id)
+fn resolve_ignoring_enabled(
+    store: &SecretsStore,
+    custom: &[CustomProvider],
+    id: &str,
+) -> Option<ResolvedProvider> {
+    resolve_direct_credential(store, custom, id)
 }
 
-fn provider_base_url(store: &SecretsStore, id: &str) -> Option<String> {
-    let info = provider_info(id);
-    store
+fn provider_base_url(
+    store: &SecretsStore,
+    custom: &[CustomProvider],
+    id: &str,
+) -> Option<String> {
+    // A user-defined provider has no built-in default: its settings entry is
+    // the canonical endpoint. The older per-provider slot and env var stay as
+    // fallbacks for entries that predate the settings list.
+    if let Some(provider) = custom_provider(custom, id) {
+        let from_settings = provider.base_url();
+        if !from_settings.is_empty() {
+            return Some(from_settings);
+        }
+    }
+
+    let stored = store
         .inner
         .get_plain(&base_url_slot(id))
         .ok()
         .flatten()
         .filter(|s| !s.trim().is_empty())
+        .map(|s| normalize_base_url(&s));
+    stored
         .or_else(|| {
-            std::env::var(format!("SIDEX_PROVIDER_{}_BASE_URL", id.to_uppercase()))
+            std::env::var(format!(
+                "SIDEX_PROVIDER_{}_BASE_URL",
+                env_provider_name(id)
+            ))
                 .ok()
                 .filter(|s| !s.trim().is_empty())
+                .map(|s| normalize_base_url(&s))
         })
         // `openai-compatible`'s catalog entry deliberately has an empty
         // `default_base_url` (there is no sensible one) -- filtered out here
@@ -444,16 +745,30 @@ fn provider_base_url(store: &SecretsStore, id: &str) -> Option<String> {
         // never stand in for "no base URL supplied" and the `?` below
         // actually fails resolution for it until the user provides one.
         .or_else(|| {
-            info.map(|i| i.default_base_url.to_string())
+            provider_info(id)
+                .map(|i| normalize_base_url(i.default_base_url))
                 .filter(|s| !s.is_empty())
         })
 }
 
-fn resolve_direct_credential(store: &SecretsStore, id: &str) -> Option<ResolvedProvider> {
+fn resolve_direct_credential(
+    store: &SecretsStore,
+    custom: &[CustomProvider],
+    id: &str,
+) -> Option<ResolvedProvider> {
     let info = provider_info(id);
-    let base_url = provider_base_url(store, id)?;
+    let custom_entry = custom_provider(custom, id);
+    let base_url = provider_base_url(store, custom, id)?;
+    let keyless =
+        info.is_some_and(|i| i.keyless) || custom_entry.is_some_and(CustomProvider::is_keyless);
+    let auth_mode = if custom_entry.is_some_and(CustomProvider::is_keyless) {
+        AUTH_NONE
+    } else {
+        AUTH_API_KEY
+    };
 
-    // 1. Explicit key from Settings.
+    // 1. Explicit key from Settings. This also covers a custom provider's
+    //    `sidex.apikey.<id>` slot, which the Settings UI writes.
     if let Ok(Some(key)) = store.inner.get(&api_key_slot(id)) {
         if !key.trim().is_empty() {
             return Some(ResolvedProvider {
@@ -461,38 +776,51 @@ fn resolve_direct_credential(store: &SecretsStore, id: &str) -> Option<ResolvedP
                 base_url,
                 api_key: Some(key),
                 source: SOURCE_SETTINGS.to_string(),
-                auth_mode: AUTH_API_KEY.to_string(),
+                auth_mode,
                 account_id: None,
             });
         }
     }
 
-    // 2. Environment.
-    if let Some(info) = info {
-        for var in info.env_vars {
-            if let Ok(val) = std::env::var(var) {
-                if !val.trim().is_empty() {
-                    return Some(ResolvedProvider {
-                        provider: id.to_string(),
-                        base_url,
-                        api_key: Some(val),
-                        source: SOURCE_ENV.to_string(),
-                        auth_mode: AUTH_API_KEY.to_string(),
-                        account_id: None,
-                    });
-                }
-            }
-        }
+    // 2. Environment: the built-in list for catalog providers, or the
+    //    per-provider `SIDEX_PROVIDER_<ID>_KEY` for a custom one.
+    let env_key = if let Some(info) = info {
+        info.env_vars
+            .iter()
+            .find_map(|var| std::env::var(var).ok().filter(|s| !s.trim().is_empty()))
+    } else {
+        std::env::var(format!(
+            "SIDEX_PROVIDER_{}_KEY",
+            env_provider_name(id)
+        ))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    };
+    if let Some(val) = env_key {
+        return Some(ResolvedProvider {
+            provider: id.to_string(),
+            base_url,
+            api_key: Some(val),
+            source: SOURCE_ENV.to_string(),
+            auth_mode,
+            account_id: None,
+        });
     }
 
-    // 3. Loopback servers need no credential at all.
-    if info.is_some_and(|i| i.keyless) {
+    // 3. No credential needed: a built-in loopback server, or a custom
+    //    endpoint the user explicitly configured with `auth: "none"`.
+    if keyless {
+        let source = if custom_entry.is_some() {
+            SOURCE_SETTINGS
+        } else {
+            SOURCE_LOCAL
+        };
         return Some(ResolvedProvider {
             provider: id.to_string(),
             base_url,
             api_key: None,
-            source: SOURCE_LOCAL.to_string(),
-            auth_mode: AUTH_API_KEY.to_string(),
+            source: source.to_string(),
+            auth_mode,
             account_id: None,
         });
     }
@@ -502,12 +830,17 @@ fn resolve_direct_credential(store: &SecretsStore, id: &str) -> Option<ResolvedP
 
 /// A connected Claude Code / Codex login. Independent of the API-key toggle:
 /// Connect is the opt-in, not the Anthropic/OpenAI row above it.
-fn resolve_cli_credential(store: &SecretsStore, id: &str) -> Option<ResolvedProvider> {
+fn resolve_cli_credential(
+    store: &SecretsStore,
+    custom: &[CustomProvider],
+    id: &str,
+) -> Option<ResolvedProvider> {
     if !cli_opt_in(store, id) {
         return None;
     }
     let cred = cli_credential(id)?;
-    let base_url = openai_oauth_base_url(id, cred.auth_mode, provider_base_url(store, id)?);
+    let base_url =
+        openai_oauth_base_url(id, cred.auth_mode, provider_base_url(store, custom, id)?);
     Some(ResolvedProvider {
         provider: id.to_string(),
         base_url,
@@ -521,14 +854,18 @@ fn resolve_cli_credential(store: &SecretsStore, id: &str) -> Option<ResolvedProv
 /// Status of every known provider, for the Settings UI. Never returns keys.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub fn providers_status(store: State<'_, Arc<SecretsStore>>) -> Vec<ProviderStatus> {
-    PROVIDERS
+pub fn providers_status(
+    store: State<'_, Arc<SecretsStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
+) -> Vec<ProviderStatus> {
+    let custom = custom_providers(&settings);
+    let mut statuses: Vec<ProviderStatus> = PROVIDERS
         .iter()
         .map(|info| {
             // Deliberately not `resolve_inner`: the toggle needs to keep
             // showing what the provider would resolve to while it's off, so
             // flipping it back on doesn't come with a surprise.
-            let resolved = resolve_ignoring_enabled(&store, info.id);
+            let resolved = resolve_ignoring_enabled(&store, &custom, info.id);
             let env_var = resolved.as_ref().and_then(|r| {
                 (r.source == SOURCE_ENV)
                     .then(|| {
@@ -546,31 +883,155 @@ pub fn providers_status(store: State<'_, Arc<SecretsStore>>) -> Vec<ProviderStat
                     .as_ref()
                     .map_or_else(|| info.default_base_url.to_string(), |r| r.base_url.clone()),
                 configured: resolved.is_some(),
+                has_key: provider_has_key(&store, info.id),
                 source: resolved.map(|r| r.source),
                 keyless: info.keyless,
                 env_var,
                 enabled: !provider_disabled(&store, info.id),
+                custom: false,
+                protocol: builtin_protocol(info.id).to_string(),
+                auth_style: builtin_auth_style(info.id, info.keyless).to_string(),
             }
         })
-        .collect()
+        .collect();
+
+    for provider in &custom {
+        let resolved = resolve_ignoring_enabled(&store, &custom, &provider.id);
+        statuses.push(ProviderStatus {
+            id: provider.id.clone(),
+            label: provider.label().to_string(),
+            base_url: resolved
+                .as_ref()
+                .map_or_else(|| provider.base_url(), |r| r.base_url.clone()),
+            configured: resolved.is_some(),
+            has_key: provider_has_key(&store, &provider.id),
+            source: resolved.map(|r| r.source),
+            keyless: provider.is_keyless(),
+            env_var: None,
+            enabled: !provider_disabled(&store, &provider.id),
+            custom: true,
+            protocol: provider.protocol().to_string(),
+            auth_style: provider.auth_style().to_string(),
+        });
+    }
+
+    statuses
 }
 
 /// Resolve the credential set the model server should run with.
 ///
 /// Returned to the Rust sidecar launcher only — see `server.rs`.
-pub fn resolve_all(store: &SecretsStore) -> Vec<ResolvedProvider> {
-    PROVIDERS
+fn resolve_all(store: &SecretsStore, custom: &[CustomProvider]) -> Vec<ResolvedProvider> {
+    let mut resolved: Vec<ResolvedProvider> = PROVIDERS
         .iter()
-        .filter_map(|info| resolve_inner(store, info.id))
-        .collect()
+        .filter_map(|info| resolve_inner(store, custom, info.id))
+        .collect();
+    for provider in custom {
+        if let Some(entry) = resolve_inner(store, custom, &provider.id) {
+            resolved.push(entry);
+        }
+    }
+    resolved
 }
 
 // ---------------------------------------------------------------------------
 // Writes
 // ---------------------------------------------------------------------------
 
-/// Save a provider credential. An empty `api_key` clears it, which lets the
-/// next source in the precedence chain take over.
+/// What a `providers_save` call should do to the stored API key.
+///
+/// The three-way split exists because `None` used to mean "clear it": editing
+/// only the base URL sent no key and silently deleted the one the user had just
+/// saved. `Keep` makes "this call is not about the key" explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyAction {
+    Keep,
+    Set,
+    Clear,
+}
+
+fn parse_api_key_action(
+    action: Option<&str>,
+    api_key: Option<&str>,
+) -> Result<ApiKeyAction, String> {
+    match action.map(str::trim) {
+        Some("keep") => Ok(ApiKeyAction::Keep),
+        Some("set") => Ok(ApiKeyAction::Set),
+        Some("clear") => Ok(ApiKeyAction::Clear),
+        Some(other) => Err(format!(
+            "invalid apiKeyAction {other:?}: expected \"keep\", \"set\" or \"clear\""
+        )),
+        // Older clients did not send the action. Infer the intent from the
+        // key they passed: a value sets it, an explicitly empty one clears it,
+        // and omitting the key entirely now means "leave it alone" rather than
+        // "delete it".
+        None => match api_key {
+            Some("") => Ok(ApiKeyAction::Clear),
+            Some(_) => Ok(ApiKeyAction::Set),
+            None => Ok(ApiKeyAction::Keep),
+        },
+    }
+}
+
+fn save_provider(
+    store: &SecretsStore,
+    provider: &str,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    action: ApiKeyAction,
+) -> Result<(), String> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Err("provider id is required".to_string());
+    }
+
+    // Validate the URL before writing anything: a rejected URL must not leave
+    // the key half-saved.
+    let normalized_url = match base_url.map(str::trim) {
+        Some("") | None => None,
+        Some(url) => {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err("base URL must start with http:// or https://".to_string());
+            }
+            Some(normalize_base_url(url))
+        }
+    };
+
+    match action {
+        ApiKeyAction::Keep => {}
+        ApiKeyAction::Clear => {
+            let _ = store.inner.delete(&api_key_slot(provider));
+        }
+        ApiKeyAction::Set => {
+            let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) else {
+                return Err("apiKeyAction is \"set\" but no API key was provided".to_string());
+            };
+            store
+                .inner
+                .set(&api_key_slot(provider), key)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    match normalized_url {
+        Some(url) => store
+            .inner
+            .set_plain(&base_url_slot(provider), &url)
+            .map_err(|e| e.to_string())?,
+        None => {
+            let _ = store.inner.delete_plain(&base_url_slot(provider));
+        }
+    }
+
+    Ok(())
+}
+
+/// Save a provider credential.
+///
+/// `apiKeyAction` is one of `keep`, `set` or `clear`; `keep` never touches
+/// the stored key. An empty/absent `baseUrl` still clears the base-URL override
+/// (a provider with a shipped default falls back to it), matching the previous
+/// behaviour for that field.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn providers_save(
@@ -578,37 +1039,16 @@ pub fn providers_save(
     provider: String,
     api_key: Option<String>,
     base_url: Option<String>,
+    api_key_action: Option<String>,
 ) -> Result<(), String> {
-    if provider.trim().is_empty() {
-        return Err("provider id is required".to_string());
-    }
-
-    match api_key.as_deref().map(str::trim) {
-        Some("") | None => {
-            let _ = store.inner.delete(&api_key_slot(&provider));
-        }
-        Some(key) => store
-            .inner
-            .set(&api_key_slot(&provider), key)
-            .map_err(|e| e.to_string())?,
-    }
-
-    match base_url.as_deref().map(str::trim) {
-        Some("") | None => {
-            let _ = store.inner.delete_plain(&base_url_slot(&provider));
-        }
-        Some(url) => {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err("base URL must start with http:// or https://".to_string());
-            }
-            store
-                .inner
-                .set_plain(&base_url_slot(&provider), url.trim_end_matches('/'))
-                .map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
+    let action = parse_api_key_action(api_key_action.as_deref(), api_key.as_deref())?;
+    save_provider(
+        &store,
+        &provider,
+        api_key.as_deref(),
+        base_url.as_deref(),
+        action,
+    )
 }
 
 /// The delete action itself, pulled out of `providers_delete` so it's callable
@@ -1344,16 +1784,21 @@ pub struct ProviderModel {
 }
 
 /// The Go server derives a request's provider by splitting the model id on
-/// `/` (`ProviderFromModelID`, internal/ai). Anthropic's `/models` endpoint
-/// returns bare ids (`claude-opus-5`) with no prefix at all, so one of those
-/// handed back unqualified would be unroutable; applied to every provider
-/// uniformly since a custom OpenAI-compatible base URL could in principle
-/// return pre-qualified ids too, and those must be left alone.
+/// `/` (`ProviderFromModelID`, internal/ai), then strips exactly one prefix
+/// (`DirectModelID`). Every id handed to the UI must therefore start with the
+/// real provider id.
+///
+/// Prefixing on "contains no slash" is wrong for self-hosted endpoints: a vLLM
+/// server serves `Qwen/Qwen2.5-72B-Instruct`, and a bare `anthropic/claude-...`
+/// from an OpenRouter-style aggregator must stay routed to *that aggregator*,
+/// not to whichever provider its slug happens to name. So: keep an id that
+/// already starts with `<provider>/`, prefix everything else.
 fn qualify_model_id(provider: &str, id: String) -> String {
-    if id.contains('/') {
+    let prefix = format!("{provider}/");
+    if id.starts_with(&prefix) {
         id
     } else {
-        format!("{provider}/{id}")
+        format!("{prefix}{id}")
     }
 }
 
@@ -1470,11 +1915,38 @@ fn codex_client_version() -> String {
 /// Split out of `providers_list_models` so the per-provider header quirks
 /// live in this one match rather than an if-chain that would otherwise grow
 /// with every provider added to `PROVIDERS`.
+///
+/// A custom provider declares its own header style, so it is handled before
+/// the built-in strategies: a self-hosted gateway that wants `x-api-key` must
+/// not be sent a Bearer token just because its id is not `anthropic`.
 fn apply_auth_headers(
     mut req: reqwest::RequestBuilder,
     provider: &str,
     resolved: &ResolvedProvider,
+    custom: Option<&CustomProvider>,
 ) -> reqwest::RequestBuilder {
+    if let Some(provider_cfg) = custom {
+        if provider_cfg.protocol() == PROTOCOL_ANTHROPIC {
+            req = req.header("anthropic-version", ANTHROPIC_VERSION);
+        }
+        let key = resolved.api_key.as_deref();
+        return match provider_cfg.auth_style() {
+            AUTH_NONE => req,
+            "x-api-key" => match key {
+                Some(key) => req.header("x-api-key", key),
+                None => req,
+            },
+            "api-key" => match key {
+                Some(key) => req.header("api-key", key),
+                None => req,
+            },
+            _ => match key {
+                Some(key) => req.bearer_auth(key),
+                None => req,
+            },
+        };
+    }
+
     match header_style(provider, resolved) {
         HeaderStyle::AnthropicNative => {
             // Every Anthropic REST call needs this, key or OAuth alike -- an
@@ -1521,6 +1993,21 @@ fn apply_auth_headers(
     }
 }
 
+/// Where a provider's `/models` endpoint lives. The Codex Responses host is
+/// the one shape that needs a client-version query parameter; everything else
+/// is the plain OpenAI layout.
+fn models_url(provider: &str, resolved: &ResolvedProvider) -> String {
+    if header_style(provider, resolved) == HeaderStyle::OpenAICodex {
+        format!(
+            "{}/models?client_version={}",
+            resolved.base_url,
+            codex_client_version()
+        )
+    } else {
+        format!("{}/models", resolved.base_url)
+    }
+}
+
 /// List the models a configured provider actually offers.
 ///
 /// Used by Settings → Models so the catalog reflects what the user can really
@@ -1529,29 +2016,26 @@ fn apply_auth_headers(
 #[allow(clippy::needless_pass_by_value)]
 pub async fn providers_list_models(
     store: State<'_, Arc<SecretsStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
     provider: String,
 ) -> Result<Vec<ProviderModel>, String> {
-    let resolved =
-        resolve_inner(&store, &provider).ok_or_else(|| format!("{provider} is not configured"))?;
+    let custom = custom_providers(&settings);
+    let resolved = resolve_inner(&store, &custom, &provider)
+        .ok_or_else(|| format!("{provider} is not configured"))?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
 
-    let models_url = if header_style(&provider, &resolved) == HeaderStyle::OpenAICodex {
-        format!(
-            "{}/models?client_version={}",
-            resolved.base_url,
-            codex_client_version()
-        )
-    } else {
-        format!("{}/models", resolved.base_url)
-    };
-    let req = client.get(models_url);
-    let req = apply_auth_headers(req, &provider, &resolved);
+    let request = apply_auth_headers(
+        client.get(models_url(&provider, &resolved)),
+        &provider,
+        &resolved,
+        custom_provider(&custom, &provider),
+    );
 
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = request.send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("{provider} returned HTTP {}", status.as_u16()));
@@ -1560,6 +2044,111 @@ pub async fn providers_list_models(
     // Preserve the API's own ordering (Anthropic returns newest first) --
     // this must not sort.
     Ok(provider_models_from_list(&provider, list))
+}
+
+/// Result of a "Test connection" click in Settings → Models.
+///
+/// The message is meant for the UI verbatim: it never contains the API key, and
+/// an HTTP error body is redacted and truncated before it gets here.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTestResult {
+    pub ok: bool,
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    pub model_count: Option<usize>,
+    pub message: String,
+}
+
+/// Redact the key (in case a provider echoed it back) and keep only a short
+/// prefix of an error body, so a failure is useful without leaking credentials.
+fn sanitize_test_body(body: &str, api_key: Option<&str>) -> String {
+    let mut text = body.trim().to_string();
+    if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+        if text.contains(key) {
+            text = text.replace(key, "[redacted]");
+        }
+    }
+    if text.chars().count() <= 300 {
+        return text;
+    }
+    let mut truncated: String = text.chars().take(300).collect();
+    truncated.push_str("...");
+    truncated
+}
+
+/// Check that a configured provider is reachable and that its base URL/key
+/// work, without spending tokens. Uses `/models`, which every provider SideX
+/// supports exposes; a 404 is reported with a "missing /v1" hint instead of
+/// being indistinguishable from a bad key.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn providers_test(
+    store: State<'_, Arc<SecretsStore>>,
+    settings: State<'_, Arc<SettingsStore>>,
+    provider: String,
+) -> Result<ProviderTestResult, String> {
+    let custom = custom_providers(&settings);
+    let resolved = resolve_inner(&store, &custom, &provider)
+        .ok_or_else(|| format!("{provider} is not configured"))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let started = Instant::now();
+    let request = apply_auth_headers(
+        client.get(models_url(&provider, &resolved)),
+        &provider,
+        &resolved,
+        custom_provider(&custom, &provider),
+    );
+
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => {
+            return Ok(ProviderTestResult {
+                ok: false,
+                status: None,
+                latency_ms: started.elapsed().as_millis() as u64,
+                model_count: None,
+                message: format!("could not reach {}: {e}", resolved.base_url),
+            });
+        }
+    };
+
+    let status = response.status().as_u16();
+    let ok = response.status().is_success();
+    let body = response.text().await.unwrap_or_default();
+    let parsed: Option<ModelList> = serde_json::from_str(&body).ok();
+    let model_count = parsed
+        .as_ref()
+        .map(|list| list.data.len() + list.models.len());
+
+    let message = if ok {
+        match model_count {
+            Some(count) => format!("HTTP {status} - {count} model(s) available"),
+            None => format!("HTTP {status} - reachable, but the response was not a model list"),
+        }
+    } else if status == 404 {
+        "HTTP 404 - check that the base URL includes /v1 (and that /models exists)".to_string()
+    } else {
+        let detail = sanitize_test_body(&body, resolved.api_key.as_deref());
+        if detail.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {detail}")
+        }
+    };
+
+    Ok(ProviderTestResult {
+        ok,
+        status: Some(status),
+        latency_ms: started.elapsed().as_millis() as u64,
+        model_count,
+        message,
+    })
 }
 
 fn provider_models_from_list(provider: &str, list: ModelList) -> Vec<ProviderModel> {
@@ -1581,17 +2170,46 @@ fn provider_models_from_list(provider: &str, list: ModelList) -> Vec<ProviderMod
 ///
 /// Keys travel through the process environment of a loopback-only child, which
 /// keeps them out of the webview and out of any config file on disk.
-pub fn server_env(store: &SecretsStore) -> BTreeMap<String, String> {
+///
+/// Built-in providers keep the original KEY/BASE_URL/AUTH/ACCOUNT_ID contract.
+/// A user-defined provider additionally carries PROTOCOL, AUTH_STYLE and the
+/// JSON array of model ids it declared, so the server can route it without a
+/// hardcoded catalog.
+pub fn server_env(store: &SecretsStore, settings: &SettingsStore) -> BTreeMap<String, String> {
+    let custom = custom_providers(settings);
+    server_env_with(store, &custom)
+}
+
+fn server_env_with(store: &SecretsStore, custom: &[CustomProvider]) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    for r in resolve_all(store) {
-        let up = r.provider.to_uppercase();
-        if let Some(key) = r.api_key {
-            env.insert(format!("SIDEX_PROVIDER_{up}_KEY"), key);
+    for r in resolve_all(store, custom) {
+        let up = env_provider_name(&r.provider);
+        if let Some(key) = &r.api_key {
+            env.insert(format!("SIDEX_PROVIDER_{up}_KEY"), key.clone());
         }
-        env.insert(format!("SIDEX_PROVIDER_{up}_BASE_URL"), r.base_url);
-        env.insert(format!("SIDEX_PROVIDER_{up}_AUTH"), r.auth_mode);
-        if let Some(account) = r.account_id {
-            env.insert(format!("SIDEX_PROVIDER_{up}_ACCOUNT_ID"), account);
+        env.insert(
+            format!("SIDEX_PROVIDER_{up}_BASE_URL"),
+            r.base_url.clone(),
+        );
+        env.insert(format!("SIDEX_PROVIDER_{up}_AUTH"), r.auth_mode.clone());
+        if let Some(account) = &r.account_id {
+            env.insert(
+                format!("SIDEX_PROVIDER_{up}_ACCOUNT_ID"),
+                account.clone(),
+            );
+        }
+        if let Some(provider) = custom_provider(custom, &r.provider) {
+            env.insert(
+                format!("SIDEX_PROVIDER_{up}_PROTOCOL"),
+                provider.protocol().to_string(),
+            );
+            env.insert(
+                format!("SIDEX_PROVIDER_{up}_AUTH_STYLE"),
+                provider.auth_style().to_string(),
+            );
+            let models =
+                serde_json::to_string(&provider.models).unwrap_or_else(|_| "[]".to_string());
+            env.insert(format!("SIDEX_PROVIDER_{up}_MODELS"), models);
         }
     }
     env
@@ -1722,11 +2340,11 @@ mod tests {
         delete_provider(&store, provider);
 
         assert!(
-            resolve_inner(&store, provider).is_some(),
+            resolve_inner(&store, &[], provider).is_some(),
             "sanity: a keyless provider resolves before being disabled"
         );
         assert!(
-            server_env(&store)
+            server_env_with(&store, &[])
                 .keys()
                 .any(|k| k.starts_with("SIDEX_PROVIDER_OLLAMA_")),
             "sanity: a keyless provider reaches server_env before being disabled"
@@ -1734,11 +2352,11 @@ mod tests {
 
         set_provider_enabled(&store, provider, false).unwrap();
         assert!(
-            resolve_inner(&store, provider).is_none(),
+            resolve_inner(&store, &[], provider).is_none(),
             "a disabled provider must not resolve just because it's keyless"
         );
         assert!(
-            !server_env(&store)
+            !server_env_with(&store, &[])
                 .keys()
                 .any(|k| k.starts_with("SIDEX_PROVIDER_OLLAMA_")),
             "a disabled provider must never reach the server env the Go side reads"
@@ -1746,7 +2364,7 @@ mod tests {
 
         set_provider_enabled(&store, provider, true).unwrap();
         assert!(
-            resolve_inner(&store, provider).is_some(),
+            resolve_inner(&store, &[], provider).is_some(),
             "clearing the off switch must restore the provider's normal resolution"
         );
 
@@ -1801,7 +2419,7 @@ mod tests {
         delete_provider(&store, provider);
         set_cli_opt_in(&store, provider, true).unwrap();
 
-        let direct = resolve_ignoring_enabled(&store, provider);
+        let direct = resolve_ignoring_enabled(&store, &[], provider);
         assert!(
             direct.as_ref().map(|r| r.source.as_str()) != Some(SOURCE_CLI),
             "the API Keys row must not report a Claude Code login as a typed key"
@@ -1819,7 +2437,7 @@ mod tests {
         delete_provider(&store, provider);
 
         assert!(
-            resolve_inner(&store, provider).is_none(),
+            resolve_inner(&store, &[], provider).is_none(),
             "must not resolve with nothing supplied -- it has no default base URL to fall back to"
         );
 
@@ -1827,7 +2445,7 @@ mod tests {
         // fall back to for the URL half.
         store.inner.set(&api_key_slot(provider), "sk-test").unwrap();
         assert!(
-            resolve_inner(&store, provider).is_none(),
+            resolve_inner(&store, &[], provider).is_none(),
             "a key alone must not resolve without a base URL"
         );
 
@@ -1836,7 +2454,7 @@ mod tests {
             .set_plain(&base_url_slot(provider), "https://example.com/v1")
             .unwrap();
         assert!(
-            resolve_inner(&store, provider).is_some(),
+            resolve_inner(&store, &[], provider).is_some(),
             "must resolve once both a base URL and a key are supplied"
         );
 
@@ -2148,7 +2766,7 @@ mod tests {
     // -- providers_list_models: id prefixing / name fallback -------------
 
     #[test]
-    fn qualify_model_id_prefixes_a_bare_id_only() {
+    fn qualify_model_id_prefixes_a_bare_id() {
         assert_eq!(
             qualify_model_id("anthropic", "claude-opus-5".to_string()),
             "anthropic/claude-opus-5"
@@ -2156,13 +2774,32 @@ mod tests {
     }
 
     #[test]
-    fn qualify_model_id_leaves_an_already_qualified_id_untouched() {
-        // A custom OpenAI-compatible base URL (e.g. an OpenRouter-style
-        // aggregator) can plausibly hand back ids that already carry a
-        // provider prefix; those must not become doubly-prefixed.
+    fn qualify_model_id_keeps_its_own_provider_prefix() {
+        assert_eq!(
+            qualify_model_id("myhost", "myhost/llama3".to_string()),
+            "myhost/llama3"
+        );
+    }
+
+    #[test]
+    fn qualify_model_id_prefixes_a_model_id_that_contains_a_slash() {
+        // A vLLM / Hugging Face server serves `Qwen/Qwen2.5-72B-Instruct`.
+        // The provider prefix has to go in front of the whole upstream id:
+        // otherwise the Go server reads `Qwen` as the provider and silently
+        // falls back to the default OpenRouter client.
+        assert_eq!(
+            qualify_model_id("myhost", "Qwen/Qwen2.5-72B-Instruct".to_string()),
+            "myhost/Qwen/Qwen2.5-72B-Instruct"
+        );
+    }
+
+    #[test]
+    fn qualify_model_id_prefixes_an_aggregator_slug_with_the_aggregator() {
+        // An OpenRouter-style endpoint returns `anthropic/...`; that id must
+        // stay routed to the endpoint that served it, not to Anthropic.
         assert_eq!(
             qualify_model_id("openrouter", "anthropic/claude-opus-5".to_string()),
-            "anthropic/claude-opus-5"
+            "openrouter/anthropic/claude-opus-5"
         );
     }
 
@@ -2232,5 +2869,327 @@ mod tests {
             anthropic_shape.data[0].display_name.as_deref(),
             Some("Claude Opus 5")
         );
+    }
+
+    // -- providers_save: the key/base-URL three-way action ----------------
+
+    #[test]
+    fn save_with_keep_action_never_deletes_a_stored_key() {
+        let store = test_store();
+        let provider = "openai-compatible";
+        delete_provider(&store, provider);
+
+        save_provider(
+            &store,
+            provider,
+            Some("sk-first"),
+            Some("https://example.com/v1"),
+            ApiKeyAction::Set,
+        )
+        .unwrap();
+        assert_eq!(
+            store.inner.get(&api_key_slot(provider)).unwrap().as_deref(),
+            Some("sk-first")
+        );
+
+        // The regression: saving only the base URL must not wipe the key.
+        save_provider(
+            &store,
+            provider,
+            None,
+            Some("https://other.example.com/v1"),
+            ApiKeyAction::Keep,
+        )
+        .unwrap();
+        assert_eq!(
+            store.inner.get(&api_key_slot(provider)).unwrap().as_deref(),
+            Some("sk-first")
+        );
+
+        delete_provider(&store, provider);
+    }
+
+    #[test]
+    fn save_with_clear_action_removes_the_key() {
+        let store = test_store();
+        let provider = "openai-compatible";
+        delete_provider(&store, provider);
+
+        save_provider(&store, provider, Some("sk-x"), None, ApiKeyAction::Set).unwrap();
+        save_provider(&store, provider, None, None, ApiKeyAction::Clear).unwrap();
+        assert!(store.inner.get(&api_key_slot(provider)).unwrap().is_none());
+
+        delete_provider(&store, provider);
+    }
+
+    #[test]
+    fn save_with_set_action_requires_a_key() {
+        let store = test_store();
+        assert!(
+            save_provider(
+                &store,
+                "openai-compatible",
+                Some("   "),
+                None,
+                ApiKeyAction::Set
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_clients_without_an_action_still_set_and_clear() {
+        assert_eq!(
+            parse_api_key_action(None, Some("sk-x")),
+            Ok(ApiKeyAction::Set)
+        );
+        assert_eq!(
+            parse_api_key_action(None, Some("")),
+            Ok(ApiKeyAction::Clear)
+        );
+        assert_eq!(parse_api_key_action(None, None), Ok(ApiKeyAction::Keep));
+        assert!(parse_api_key_action(Some("bogus"), Some("sk-x")).is_err());
+    }
+
+    #[test]
+    fn save_rejects_a_bad_base_url_before_touching_the_key() {
+        let store = test_store();
+        let provider = "openai-compatible";
+        delete_provider(&store, provider);
+
+        save_provider(&store, provider, Some("sk-keep"), None, ApiKeyAction::Set).unwrap();
+        assert!(
+            save_provider(
+                &store,
+                provider,
+                Some("sk-new"),
+                Some("my-host/v1"),
+                ApiKeyAction::Set
+            )
+            .is_err()
+        );
+        // The rejected call must not have applied the key half.
+        assert_eq!(
+            store.inner.get(&api_key_slot(provider)).unwrap().as_deref(),
+            Some("sk-keep")
+        );
+
+        delete_provider(&store, provider);
+    }
+
+    // -- custom providers from sidex.providers.custom --------------------
+
+    fn settings_with_custom_providers(value: serde_json::Value) -> SettingsStore {
+        let settings = SettingsStore::new();
+        settings
+            .inner
+            .write()
+            .unwrap()
+            .set(CUSTOM_PROVIDERS_KEY, value);
+        settings
+    }
+
+    #[test]
+    fn custom_providers_are_parsed_and_reach_server_env() {
+        let store = test_store();
+        let settings = settings_with_custom_providers(serde_json::json!([{
+            "id": "myhost",
+            "label": "My Host",
+            "protocol": "openai",
+            "baseUrl": "https://my-host.example/v1/",
+            "auth": "bearer",
+            "models": ["Qwen/Qwen2.5-72B-Instruct"]
+        }]));
+        let custom = custom_providers(&settings);
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].base_url(), "https://my-host.example/v1");
+
+        store
+            .inner
+            .set(&api_key_slot("myhost"), "sk-custom")
+            .unwrap();
+        let env = server_env_with(&store, &custom);
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_MYHOST_KEY").map(String::as_str),
+            Some("sk-custom")
+        );
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_MYHOST_BASE_URL")
+                .map(String::as_str),
+            Some("https://my-host.example/v1")
+        );
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_MYHOST_AUTH").map(String::as_str),
+            Some(AUTH_API_KEY)
+        );
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_MYHOST_PROTOCOL")
+                .map(String::as_str),
+            Some(PROTOCOL_OPENAI)
+        );
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_MYHOST_AUTH_STYLE")
+                .map(String::as_str),
+            Some("bearer")
+        );
+        let models = env.get("SIDEX_PROVIDER_MYHOST_MODELS").cloned().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&models).unwrap(),
+            vec!["Qwen/Qwen2.5-72B-Instruct".to_string()]
+        );
+
+        delete_provider(&store, "myhost");
+    }
+
+    #[test]
+    fn custom_provider_with_auth_none_resolves_without_a_key() {
+        let store = test_store();
+        let settings = settings_with_custom_providers(serde_json::json!([{
+            "id": "homevllm",
+            "label": "Home vLLM",
+            "protocol": "openai",
+            "baseUrl": "http://192.168.1.5:8000/v1",
+            "auth": "none"
+        }]));
+        let custom = custom_providers(&settings);
+        let resolved =
+            resolve_inner(&store, &custom, "homevllm").expect("keyless custom provider");
+        assert_eq!(resolved.base_url, "http://192.168.1.5:8000/v1");
+        assert!(resolved.api_key.is_none());
+        assert_eq!(resolved.auth_mode, AUTH_NONE);
+        assert_eq!(resolved.source, SOURCE_SETTINGS);
+
+        let env = server_env_with(&store, &custom);
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_HOMEVLLM_AUTH").map(String::as_str),
+            Some(AUTH_NONE)
+        );
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_HOMEVLLM_AUTH_STYLE")
+                .map(String::as_str),
+            Some(AUTH_NONE)
+        );
+        assert!(!env.contains_key("SIDEX_PROVIDER_HOMEVLLM_KEY"));
+    }
+
+    #[test]
+    fn custom_provider_with_bearer_auth_and_no_key_does_not_resolve() {
+        let store = test_store();
+        let settings = settings_with_custom_providers(serde_json::json!([{
+            "id": "remotegw",
+            "baseUrl": "https://gateway.example/v1",
+            "auth": "bearer"
+        }]));
+        let custom = custom_providers(&settings);
+        assert!(resolve_inner(&store, &custom, "remotegw").is_none());
+    }
+
+    #[test]
+    fn custom_providers_with_invalid_or_builtin_ids_are_ignored() {
+        let settings = settings_with_custom_providers(serde_json::json!([
+            { "id": "Bad Id", "baseUrl": "https://x.example/v1" },
+            { "id": "openai", "baseUrl": "https://x.example/v1" },
+            { "id": "half-filled" },
+            { "id": "ok-host", "baseUrl": "https://x.example/v1" }
+        ]));
+        let ids: Vec<String> = custom_providers(&settings)
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        // A half-filled entry is kept so the UI can show it as unconfigured;
+        // an invalid or built-in-shadowing id is dropped.
+        assert_eq!(ids, vec!["half-filled".to_string(), "ok-host".to_string()]);
+        let custom = custom_providers(&settings);
+        assert!(resolve_inner(&test_store(), &custom, "half-filled").is_none());
+    }
+
+    #[test]
+    fn custom_provider_protocol_and_auth_fall_back_safely() {
+        let settings = settings_with_custom_providers(serde_json::json!([{
+            "id": "gw",
+            "baseUrl": "https://gw.example/v1",
+            "protocol": "bogus",
+            "auth": "bogus"
+        }]));
+        let custom = custom_providers(&settings);
+        assert_eq!(custom[0].protocol(), PROTOCOL_OPENAI);
+        assert_eq!(custom[0].auth_style(), "bearer");
+
+        let anthropic = settings_with_custom_providers(serde_json::json!([{
+            "id": "gw",
+            "baseUrl": "https://gw.example/v1",
+            "protocol": "anthropic",
+            "auth": "x-api-key"
+        }]));
+        let custom = custom_providers(&anthropic);
+        assert_eq!(custom[0].protocol(), PROTOCOL_ANTHROPIC);
+        assert_eq!(custom[0].auth_style(), "x-api-key");
+    }
+
+    #[test]
+    fn sanitize_test_body_redacts_the_key_and_truncates() {
+        let body = format!("bad key sk-secret: {}", "x".repeat(400));
+        let sanitized = sanitize_test_body(&body, Some("sk-secret"));
+        assert!(!sanitized.contains("sk-secret"));
+        assert!(sanitized.contains("[redacted]"));
+        assert!(sanitized.chars().count() <= 303);
+    }
+
+    // -- env-var names shared with the Go server -------------------------
+
+    #[test]
+    fn env_provider_names_match_the_go_servers_rule() {
+        assert_eq!(env_provider_name("openai"), "OPENAI");
+        assert_eq!(env_provider_name("openai-compatible"), "OPENAI_COMPATIBLE");
+        assert_eq!(env_provider_name("acme.local"), "ACME_LOCAL");
+        assert_eq!(env_provider_name("my_host"), "MY_HOST");
+    }
+
+    #[test]
+    fn slug_ids_with_a_dot_or_dash_reach_server_env() {
+        let store = test_store();
+        let settings = settings_with_custom_providers(serde_json::json!([{
+            "id": "acme.local",
+            "label": "Acme",
+            "baseUrl": "https://acme.example/v1",
+            "auth": "bearer"
+        }]));
+        let custom = custom_providers(&settings);
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].id, "acme.local");
+
+        store
+            .inner
+            .set(&api_key_slot("acme.local"), "sk-acme")
+            .unwrap();
+        let env = server_env_with(&store, &custom);
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_ACME_LOCAL_KEY").map(String::as_str),
+            Some("sk-acme")
+        );
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_ACME_LOCAL_BASE_URL")
+                .map(String::as_str),
+            Some("https://acme.example/v1")
+        );
+        assert_eq!(
+            env.get("SIDEX_PROVIDER_ACME_LOCAL_AUTH_STYLE")
+                .map(String::as_str),
+            Some("bearer")
+        );
+
+        delete_provider(&store, "acme.local");
+    }
+
+    #[test]
+    fn custom_provider_id_validation_matches_the_settings_ui() {
+        assert!(valid_custom_provider_id("my-host"));
+        assert!(valid_custom_provider_id("acme.local"));
+        assert!(valid_custom_provider_id("my_host"));
+        assert!(valid_custom_provider_id("2fast"));
+        assert!(!valid_custom_provider_id("-leading"));
+        assert!(!valid_custom_provider_id("Bad Id"));
+        assert!(!valid_custom_provider_id("UPPER"));
+        assert!(!valid_custom_provider_id(""));
     }
 }

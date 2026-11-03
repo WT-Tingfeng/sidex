@@ -61,6 +61,7 @@ type Handler struct {
 	memoryStore   *context.MemoryStore
 	flowTracker   *context.FlowTracker
 	flowMu        sync.Mutex
+	cancels       *turnCancels
 }
 
 func NewHandler(sm *session.Manager, store *memory.Store, usageSvc *usage.Service, indexSvc *index.IndexService) *Handler {
@@ -102,6 +103,7 @@ func NewHandler(sm *session.Manager, store *memory.Store, usageSvc *usage.Servic
 		usageService:  usageSvc,
 		indexService:  indexSvc,
 		memoryStore:   memStore,
+		cancels:       newTurnCancels(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				origin := r.Header.Get("Origin")
@@ -376,6 +378,13 @@ func reachableModels() []cost.ModelInfo {
 	for _, cfg := range configured {
 		live, err := ai.ListRemoteModels(cfg)
 		if err != nil || len(live) == 0 {
+			// The endpoint did not advertise a catalog. A custom provider gets
+			// the model ids the desktop app declared; built-in providers fall
+			// back to the static catalog below.
+			if len(cfg.Models) > 0 {
+				out = append(out, declaredModelInfos(cfg)...)
+				continue
+			}
 			for _, m := range cost.ListModels() {
 				if m.Provider == cfg.Provider {
 					m.Default = true
@@ -404,6 +413,58 @@ func reachableModels() []cost.ModelInfo {
 	}
 	if len(out) == 0 {
 		return cost.ListModels()
+	}
+	return out
+}
+
+// Conservative metadata for custom-provider models whose endpoint does not
+// describe them: small enough that a request built from these numbers cannot
+// over-budget an endpoint whose real limits are unknown.
+const (
+	customModelContextWindow = 32_768
+	customModelMaxOutput     = 8_192
+)
+
+// declaredModelInfos turns SIDEX_PROVIDER_<ID>_MODELS into picker entries for a
+// custom provider whose /models endpoint is unavailable or empty.
+func declaredModelInfos(cfg ai.ProviderConfig) []cost.ModelInfo {
+	out := make([]cost.ModelInfo, 0, len(cfg.Models))
+	seen := make(map[string]struct{}, len(cfg.Models))
+	for _, raw := range cfg.Models {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if !strings.Contains(id, "/") {
+			id = cfg.Provider + "/" + id
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+
+		window := customModelContextWindow
+		maxOutput := customModelMaxOutput
+		if cost.IsKnownModel(id) {
+			window = cost.ContextWindowForModel(id)
+			maxOutput = cost.MaxOutputForModel(id)
+		}
+
+		name := id
+		if i := strings.Index(id, "/"); i >= 0 && i+1 < len(id) {
+			name = id[i+1:]
+		}
+		out = append(out, cost.ModelInfo{
+			ID:               id,
+			Name:             name,
+			Provider:         cfg.Provider,
+			ContextWindow:    window,
+			MaxOutput:        maxOutput,
+			SupportsTools:    true,
+			SupportsThinking: cost.SupportsThinking(id),
+			Default:          true,
+			Pricing:          cost.LookupPricing(id),
+		})
 	}
 	return out
 }
@@ -572,6 +633,26 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		if frame := tryParseCancel(message); frame != nil {
+			// Stop the turn bound to this connection, or the one the frame names
+			// (a client may send the cancel from a fresh connection when a chat
+			// is closed/backgrounded). A connection bound to a session cannot
+			// cancel a different one.
+			sessionID := frame.SessionID
+			if sessionID == "" && sess != nil {
+				sessionID = sess.ID
+			}
+			if sessionID != "" && (sess == nil || frame.SessionID == "" || frame.SessionID == sess.ID) {
+				active := h.cancelTurn(sessionID)
+				sc.WriteJSON(map[string]interface{}{
+					"type":       "canceled",
+					"session_id": sessionID,
+					"active":     active,
+				})
+			}
+			continue
+		}
+
 		var req ChatRequest
 		if err := json.Unmarshal(message, &req); err != nil {
 			sc.WriteJSON(ai.StreamChunk{Type: "error", Error: err.Error()})
@@ -732,7 +813,14 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 		}(sc, sess, ctx)
 	}
 
-	// Connection closed — clean up background shells for this session.
+	// Connection closed — stop any turn still streaming for this session: the
+	// client is gone, so nobody will read the rest of the response (this is the
+	// path taken when a chat window is closed or backgrounded).
+	if sess != nil {
+		h.cancelTurn(sess.ID)
+	}
+
+	// Clean up background shells for this session.
 	// Note: sandbox is NOT auto-deleted here — the client verification step
 	// needs it alive to extract git diff and run tests. Client deletes it after.
 	if sess != nil && sess.Tools != nil {
@@ -778,6 +866,17 @@ func (h *Handler) runAgentLoopWithAgents(sc *safeConn, sess *session.Session, ct
 	if activeAgents == nil {
 		activeAgents = make(map[string]*agent.ActiveSubAgent)
 	}
+
+	// One cancelable context per turn. The WebSocket read loop cancels it on a
+	// {"type":"cancel"} frame (or when the connection closes), which aborts the
+	// in-flight provider request and stops the loop at the next turn boundary.
+	turnCtx, endTurn := h.beginTurn(sess.ID)
+	defer endTurn()
+	finishCanceled := func() {
+		h.sm.SaveTranscript(sess)
+		sc.WriteJSON(ai.StreamChunk{Type: "done", Done: true})
+	}
+
 	cfg := agent.DefaultConfig()
 	cfg.PermMode = sc.permMode
 	cfg.SessionAllowed = sc.sessionAllow
@@ -908,6 +1007,11 @@ func (h *Handler) runAgentLoopWithAgents(sc *safeConn, sess *session.Session, ct
 	// Custom loop that handles spawn_agents specially (subagents need the
 	// aiClient and memory store which are Handler-level concerns).
 	for turn := 0; ; turn++ {
+		if turnCtx.Err() != nil {
+			finishCanceled()
+			return
+		}
+
 		// Max turns guard: stop the agent if it's exceeded the configured limit.
 		if turn >= cfg.MaxTurns {
 			sc.WriteJSON(ai.StreamChunk{Type: "error", Error: "agent reached maximum turns"})
@@ -966,6 +1070,7 @@ func (h *Handler) runAgentLoopWithAgents(sc *safeConn, sess *session.Session, ct
 			SessionID:      sess.ID,
 			ThinkingBudget: cfg.ThinkingBudget,
 			Effort:         cfg.Effort,
+			Context:        turnCtx,
 		}
 
 		err := client.StreamChatWithOptions(messages, toolDefs, sysPrompt, streamOpts, func(chunk ai.StreamChunk) {
@@ -1059,6 +1164,13 @@ func (h *Handler) runAgentLoopWithAgents(sc *safeConn, sess *session.Session, ct
 		}
 
 		if err != nil {
+			if turnCtx.Err() != nil {
+				// The client stopped the turn (or its socket closed): the read
+				// error is our own cancellation, not a provider failure, so end
+				// the turn quietly instead of reporting an API error.
+				finishCanceled()
+				return
+			}
 			errMsg := ai.SanitizeErrorForDisplay(err)
 			sc.WriteJSON(ai.StreamChunk{Type: "error", Error: errMsg})
 			sc.WriteJSON(ai.StreamChunk{Type: "done", Done: true})
@@ -1132,6 +1244,22 @@ func (h *Handler) runAgentLoopWithAgents(sc *safeConn, sess *session.Session, ct
 			pendingToolCalls = allowedToolCalls
 			if len(pendingToolCalls) == 0 {
 				continue
+			}
+
+			if turnCtx.Err() != nil {
+				// The assistant turn with these tool calls is already in the
+				// session; every call needs a matching result or the next model
+				// turn is malformed. Record cancellations for the whole batch.
+				for _, tc := range pendingToolCalls {
+					sess.AddMessage(ai.Message{
+						Role:       ai.RoleTool,
+						Content:    "Canceled by the user before this tool ran.",
+						ToolCallID: tc.ID,
+						Name:       tc.Function.Name,
+					})
+				}
+				finishCanceled()
+				return
 			}
 
 			allReadOnly := true
@@ -1230,6 +1358,11 @@ func (h *Handler) runAgentLoopWithAgents(sc *safeConn, sess *session.Session, ct
 						fireAfterToolUseHook(sess, cfg.Hooks, tc, turn, tracker.TotalCost())
 					}
 				}
+			}
+
+			if turnCtx.Err() != nil {
+				finishCanceled()
+				return
 			}
 
 			// Record feedback signals for tool outcomes
