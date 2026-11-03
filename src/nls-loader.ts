@@ -169,17 +169,20 @@ export async function loadNlsMessages(): Promise<void> {
 		if (extensionId) {
 			localStorage.setItem('vscode.nls.languagePackExtensionId', extensionId);
 			console.log('[SideX NLS] auto-detected language pack:', extensionId);
-		} else {
-			console.warn('[SideX NLS] No language pack found for locale:', locale);
-			return;
 		}
 	}
 
 	try {
-		const translations = (await loadFromDisk(extensionId)) ?? (await loadFromGallery(extensionId));
+		// Prefer translations bundled with the app: they were built against this
+		// fork's module paths, unlike a user-installed pack from another VS Code
+		// version (a 1.131 pack cannot match a 1.110 fork). Falls back to the
+		// installed pack, then the gallery.
+		const bundled = await loadBundledTranslations(locale);
+		const translations = bundled
+			?? (extensionId ? ((await loadFromDisk(extensionId)) ?? (await loadFromGallery(extensionId))) : null);
 
 		if (!translations) {
-			console.warn('[SideX NLS] No translations found for', extensionId);
+			console.warn('[SideX NLS] No translations found for locale:', locale);
 			return;
 		}
 
@@ -201,7 +204,10 @@ export async function loadNlsMessages(): Promise<void> {
 			if (contentType.includes('json')) {
 				const nlsEntries: Array<{ key: string; msg: string }> = await indexRes.json();
 				if (nlsEntries.length > 0) {
-					(globalThis as any)._VSCODE_NLS_MESSAGES = nlsEntries.map(({ key, msg }) => translations[key] ?? msg);
+					(globalThis as any)._VSCODE_NLS_MESSAGES = nlsEntries.map(({ key, msg }) => {
+						const shortKey = key.slice(key.lastIndexOf('/') + 1);
+						return translations[key] ?? translations[shortKey] ?? msg;
+					});
 					(globalThis as any)._VSCODE_NLS_LANGUAGE = locale;
 					console.log(`[SideX NLS] Loaded ${nlsEntries.length} translations for ${locale} (indexed mode)`);
 					return;
@@ -293,15 +299,43 @@ async function loadFromGallery(extensionId: string): Promise<Translations | null
 
 function parseBundle(raw: string): Translations | null {
 	try {
-		const bundles = JSON.parse(raw)?.contents;
-		if (!bundles) {
+		const parsed = JSON.parse(raw) as { contents?: unknown } | null;
+		const contents = parsed && typeof parsed === 'object' && parsed.contents ? parsed.contents : parsed;
+		if (!contents || typeof contents !== 'object') {
 			return null;
 		}
+		// Language pack layout: contents[modulePath][shortKey] = translation.
+		// The nls index keys entries as "modulePath/shortKey", so keep the
+		// module path in the flattened key.
 		const messages: Translations = {};
-		for (const bundle of Object.values(bundles)) {
-			Object.assign(messages, bundle);
+		for (const [moduleId, entries] of Object.entries(contents as Record<string, unknown>)) {
+			if (!moduleId || !entries || typeof entries !== 'object' || Array.isArray(entries)) {
+				continue;
+			}
+			for (const [key, value] of Object.entries(entries as Record<string, unknown>)) {
+				if (typeof value === 'string') {
+					messages[moduleId + '/' + key] = value;
+				}
+			}
 		}
-		return messages;
+		return Object.keys(messages).length > 0 ? messages : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Translations bundled with the app (public/nls.<locale>.json), if present. */
+async function loadBundledTranslations(locale: string): Promise<Translations | null> {
+	try {
+		const res = await fetchWithTimeout('/nls.' + locale.toLowerCase() + '.json', NLS_INDEX_TIMEOUT_MS);
+		if (!res.ok) {
+			return null;
+		}
+		const result = parseBundle(await res.text());
+		if (result) {
+			console.log('[SideX NLS] Loaded bundled translations for', locale);
+		}
+		return result;
 	} catch {
 		return null;
 	}

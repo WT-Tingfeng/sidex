@@ -58,6 +58,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci --include=dev --no-audit --no-fund
 
+      - name: Fetch zh-CN language pack (best effort)
+        continue-on-error: true
+        run: node scripts/fetch-zh-language-pack.mjs
+
       - name: Build frontend
         env:
           NODE_OPTIONS: "--max-old-space-size=12288"

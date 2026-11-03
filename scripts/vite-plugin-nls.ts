@@ -54,7 +54,7 @@ export function nlsPlugin(): Plugin {
 					continue;
 				}
 				const msg = unquote(code.slice(afterComma, strEnd + 1));
-				getOrAddIndex(key, msg);
+				getOrAddIndex(moduleIdFromFile(file) + '/' + key, msg);
 				count++;
 			}
 		}
@@ -108,6 +108,7 @@ export function nlsPlugin(): Plugin {
 			let result = '';
 			let pos = 0;
 			let didChange = false;
+			const moduleId = moduleIdFromFile(id);
 
 			const re = /\blocalize2?\s*\(/g;
 			let m: RegExpExecArray | null;
@@ -131,7 +132,7 @@ export function nlsPlugin(): Plugin {
 				}
 
 				const msg = unquote(code.slice(afterComma, strEnd + 1));
-				const idx = getOrAddIndex(key, msg);
+				const idx = getOrAddIndex(moduleId + '/' + key, msg);
 
 				result += code.slice(pos, argsStart);
 				result += String(idx);
@@ -157,6 +158,18 @@ export function nlsPlugin(): Plugin {
 			}
 		}
 	};
+}
+
+/**
+ * Maps a source file to the module id used by VS Code language packs: the
+ * path below src/, without the .ts extension (e.g. vs/base/common/platform).
+ */
+function moduleIdFromFile(file: string): string {
+	const normalized = file.replace(/\\/g, '/');
+	const marker = '/src/';
+	const index = normalized.lastIndexOf(marker);
+	const rest = index >= 0 ? normalized.slice(index + marker.length) : normalized;
+	return rest.replace(/\.ts$/, '');
 }
 
 function extractKey(arg: string): string | null {
