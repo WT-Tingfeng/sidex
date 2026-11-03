@@ -5,22 +5,44 @@
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { createCustomDropdown } from '../sidexSettingsStyles.js';
-
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
-
-interface SettingsData {
-	[key: string]: unknown;
-}
+import {
+	decodeSettingValue,
+	readSettingValue,
+	readSettingsSection,
+	toSettingBoolean,
+	toSettingString,
+	writeSettingValue,
+	type SettingsSectionValues,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
 interface ModelOption {
 	value: string;
 	label: string;
 }
 
+const GENERAL_SECTION = 'sidex.general';
+const GENERAL_SETTING_KEYS = [
+	'defaultAgent',
+	'autoScroll',
+	'windowLayout',
+	'conversationDensity',
+	'titleBar',
+	'statusBar',
+	'reviewControlLocation',
+	'autoHideEditor',
+	'chatAsTabs',
+	'systemNotifications',
+	'menuBarIcon',
+	'completionSound',
+	'dataSharing',
+	'defaultModel'
+];
+
 export class GeneralSection implements SettingsSection {
 	private _container: HTMLElement | null = null;
 	private _invoke: TauriInvoke;
-	private _settings: SettingsData = {};
+	private _settings: SettingsSectionValues = {};
 	private _modelOptions: ModelOption[] = [];
 
 	constructor(invoke: TauriInvoke) {
@@ -31,10 +53,10 @@ export class GeneralSection implements SettingsSection {
 		this._container = container;
 
 		if (this._invoke) {
-			try {
-				const data = await this._invoke('settings_get', { section: 'sidex.general' }) as SettingsData | null;
-				if (data) { this._settings = data; }
-			} catch { /* use defaults */ }
+			// Section read first, exact per-key reads for anything the backend
+			// does not return (works with both the new prefix-capable backend
+			// and the older exact-key-only one).
+			this._settings = await readSettingsSection(this._invoke, GENERAL_SECTION, GENERAL_SETTING_KEYS);
 			await this._loadModelOptions();
 		}
 
@@ -55,7 +77,7 @@ export class GeneralSection implements SettingsSection {
 				{ value: 'plan', label: 'Plan' },
 				{ value: 'ask', label: 'Ask' }
 			],
-			this._getSetting('defaultAgent', 'agent') as string,
+			this._getText('defaultAgent', 'agent'),
 			'sidex.general.defaultAgent'
 		);
 
@@ -65,7 +87,7 @@ export class GeneralSection implements SettingsSection {
 			'Auto scroll on message',
 			'Automatically scroll the conversation viewport down when a new message is received.',
 			'sidex.general.autoScroll',
-			this._getSetting('autoScroll', true) as boolean
+			this._getBoolean('autoScroll', true)
 		);
 	}
 
@@ -107,7 +129,7 @@ export class GeneralSection implements SettingsSection {
 		const resetRow = this._createRow(card, 'Reset Don\'t Ask Again Dialogs', 'Show previously dismissed dialogs');
 		this._addButton(resetRow, 'Show', () => {
 			if (this._invoke) {
-				this._invoke('settings_update', { key: 'sidex.general.dismissedDialogs', value: JSON.stringify({}), scope: 'user' }).then(() => {
+				writeSettingValue(this._invoke, 'sidex.general.dismissedDialogs', {}).then(() => {
 					this._showToast('All dialogs have been reset.');
 				}).catch(() => {});
 			}
@@ -119,25 +141,25 @@ export class GeneralSection implements SettingsSection {
 		const card = this._createCard(container);
 
 		this._addSelectRow(card, 'Window Layout', 'Choose default window arrangement',
-			['Editor', 'Agent'], this._getSetting('windowLayout', 'Editor') as string, 'sidex.general.windowLayout');
+			['Editor', 'Agent'], this._getText('windowLayout', 'Editor'), 'sidex.general.windowLayout');
 
 		this._addSelectRow(card, 'Conversation Density', 'Adjust chat message spacing',
-			['Compact', 'Comfortable', 'Spacious'], this._getSetting('conversationDensity', 'Comfortable') as string, 'sidex.general.conversationDensity');
+			['Compact', 'Comfortable', 'Spacious'], this._getText('conversationDensity', 'Comfortable'), 'sidex.general.conversationDensity');
 
 		this._addToggleRow(card, 'Title Bar', 'Show the window title bar',
-			'sidex.general.titleBar', this._getSetting('titleBar', true) as boolean);
+			'sidex.general.titleBar', this._getBoolean('titleBar', true));
 
 		this._addToggleRow(card, 'Status Bar', 'Show the status bar at the bottom',
-			'sidex.general.statusBar', this._getSetting('statusBar', true) as boolean);
+			'sidex.general.statusBar', this._getBoolean('statusBar', true));
 
 		this._addSelectRow(card, 'Review Control Location', 'Where to show review controls',
-			['Gutter', 'Toolbar', 'Both'], this._getSetting('reviewControlLocation', 'Gutter') as string, 'sidex.general.reviewControlLocation');
+			['Gutter', 'Toolbar', 'Both'], this._getText('reviewControlLocation', 'Gutter'), 'sidex.general.reviewControlLocation');
 
 		this._addToggleRow(card, 'Auto-hide editor when empty', 'Collapse editor panel if no tabs are open',
-			'sidex.general.autoHideEditor', this._getSetting('autoHideEditor', false) as boolean);
+			'sidex.general.autoHideEditor', this._getBoolean('autoHideEditor', false));
 
 		const tabsRow = this._addToggleRow(card, 'Open chat as editor tabs', '',
-			'sidex.general.chatAsTabs', this._getSetting('chatAsTabs', false) as boolean);
+			'sidex.general.chatAsTabs', this._getBoolean('chatAsTabs', false));
 		const badge = document.createElement('span');
 		badge.className = 'sidex-settings-new-badge';
 		badge.textContent = 'NEW';
@@ -149,13 +171,13 @@ export class GeneralSection implements SettingsSection {
 		const card = this._createCard(container);
 
 		this._addToggleRow(card, 'System Notifications', 'Show OS-level notifications',
-			'sidex.general.systemNotifications', this._getSetting('systemNotifications', true) as boolean);
+			'sidex.general.systemNotifications', this._getBoolean('systemNotifications', true));
 
 		this._addToggleRow(card, 'Menu Bar Icon', 'Show icon in the system tray/menu bar',
-			'sidex.general.menuBarIcon', this._getSetting('menuBarIcon', true) as boolean);
+			'sidex.general.menuBarIcon', this._getBoolean('menuBarIcon', true));
 
 		this._addToggleRow(card, 'Completion Sound', 'Play a sound when operations complete',
-			'sidex.general.completionSound', this._getSetting('completionSound', false) as boolean);
+			'sidex.general.completionSound', this._getBoolean('completionSound', false));
 	}
 
 	private _renderPrivacy(container: HTMLElement): void {
@@ -164,7 +186,7 @@ export class GeneralSection implements SettingsSection {
 		this._addToggleRow(card,
 			'Data Sharing',
 			'Help improve SideX by sharing anonymous usage data. No code or personal information is ever collected.',
-			'sidex.general.dataSharing', this._getSetting('dataSharing', true) as boolean);
+			'sidex.general.dataSharing', this._getBoolean('dataSharing', true));
 	}
 
 
@@ -178,8 +200,8 @@ export class GeneralSection implements SettingsSection {
 	private async _loadModelOptions(): Promise<void> {
 		if (!this._invoke) { return; }
 		try {
-			const raw = await this._invoke('settings_get', { section: 'sidex.models.custom' });
-			const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+			const raw = await readSettingValue(this._invoke, 'sidex.models.custom');
+			const arr = decodeSettingValue(raw);
 			if (!Array.isArray(arr)) { return; }
 			this._modelOptions = arr
 				.map((entry: string | { id?: string; name?: string }) => {
@@ -212,20 +234,26 @@ export class GeneralSection implements SettingsSection {
 			'Default AI Model',
 			'Select which AI model new conversations will start with by default.',
 			options,
-			this._getSetting('defaultModel', '') as string,
+			this._getText('defaultModel', ''),
 			'sidex.general.defaultModel'
 		);
 	}
 
 	// --- Helpers ---
 
-	private _getSetting(key: string, defaultValue: unknown): unknown {
-		return this._settings[key] ?? defaultValue;
+	private _getBoolean(key: string, defaultValue: boolean): boolean {
+		return toSettingBoolean(this._settings[key], defaultValue);
+	}
+
+	private _getText(key: string, defaultValue: string): string {
+		return toSettingString(this._settings[key], defaultValue);
 	}
 
 	private _saveSetting(key: string, value: unknown): void {
 		if (!this._invoke) { return; }
-		this._invoke('settings_update', { key, value: JSON.stringify(value), scope: 'user' }).then(() => {
+		// Store a plain JSON value; legacy builds used JSON.stringify(), which
+		// is why old settings files contain 'true' / '"Agent"' strings.
+		writeSettingValue(this._invoke, key, value).then(() => {
 			window.dispatchEvent(new CustomEvent('sidex-settings-changed'));
 		}).catch(() => {});
 	}

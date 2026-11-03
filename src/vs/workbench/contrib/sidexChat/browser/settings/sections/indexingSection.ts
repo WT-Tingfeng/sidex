@@ -10,8 +10,12 @@
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { SidexChatService } from '../../sidexChatService.js';
-
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
+import {
+	readSettingValue,
+	toSettingBoolean,
+	writeSettingValue,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
 interface IndexStats {
 	total_files: number;
@@ -368,20 +372,17 @@ export class IndexingSection implements SettingsSection {
 		toggle.className = 'sidex-settings-toggle' + (defaultOn ? ' on' : '');
 
 		if (this._invoke) {
-			this._invoke('settings_get', { section: key }).then((val) => {
-				if (val === true) { toggle.classList.add('on'); }
-				else if (val === false) { toggle.classList.remove('on'); }
+			readSettingValue(this._invoke, key).then((val) => {
+				toggle.classList.toggle('on', toSettingBoolean(val, defaultOn));
 			}).catch(() => {});
 		}
 
 		toggle.addEventListener('click', () => {
 			toggle.classList.toggle('on');
 			if (this._invoke) {
-				this._invoke('settings_update', {
-					key,
-					value: JSON.stringify(toggle.classList.contains('on')),
-					scope: 'user',
-				}).catch(() => {});
+				// Plain JSON boolean; legacy builds stored the JSON.stringify()-ed
+				// string 'true'/'false'.
+				writeSettingValue(this._invoke, key, toggle.classList.contains('on')).catch(() => {});
 			}
 		});
 

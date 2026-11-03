@@ -523,6 +523,7 @@ const ZH_CN: Record<string, string> = {
 	'SideX Usage': 'SideX 用量',
 	'Command Palette...': '命令面板...',
 	'Open Keyboard Shortcuts [⌘K ⌘S]': '打开键盘快捷方式 [⌘K ⌘S]',
+	'Open Keyboard Shortcuts [Ctrl+K Ctrl+S]': '打开键盘快捷方式 [Ctrl+K Ctrl+S]',
 	'Extensions': '扩展',
 	'Configure Snippets': '配置代码片段',
 	'Tasks': '任务',
@@ -603,6 +604,9 @@ const PATTERN_RULES: Array<{ re: RegExp; to: (...groups: string[]) => string }> 
 	{ re: /^SideX will use your (.+) login \((.+)\) to run (.+) models\.$/, to: (name, who, provider) => `SideX 将使用你的 ${name} 登录（${who}）来运行 ${provider} 模型。` },
 	{ re: /^The credential is read from (.+) and passed only to the agent server running on your own machine\. It is never sent anywhere else, and never shown in the app\.$/, to: location => `凭据从 ${location} 读取，只会传递给你本机运行的智能体服务器。它绝不会发送到其他地方，也不会在应用中显示。` },
 	{ re: /^Open ([/~][^\s]*)$/, to: path => `打开 ${path}` },
+	// SCM commit placeholder; the platform modifier (⌘ on macOS, Ctrl+ elsewhere)
+	// is part of the string so both variants translate.
+	{ re: /^Message \((⌘|Ctrl\+)Enter to commit on "(.+)"\)$/, to: (modifier, name) => `消息（${modifier}Enter 在 "${name}" 上提交）` },
 	{ re: /^(.+) account$/, to: name => `${name} 账户` }
 ];
 

@@ -11,6 +11,23 @@ const SPLASH_SAFETY_TIMEOUT_MS = 15_000;
 
 let splashRemoved = false;
 
+// ─── OS-opened files bridge (Rust -> workbench) ─────────────────────────────
+// The Rust side buffers paths passed on the command line (file associations,
+// "Open with", second-instance launches) and emits them through this event
+// while the app is running. Paths that arrived before this script ran are
+// drained once via `open_paths_take`.
+const OPEN_FILE_EVENT = 'sidex://open-file';
+const OPEN_PATHS_TAKE_COMMAND = 'open_paths_take';
+const OPEN_PATHS_DELIVERY_EVENT = 'sidex-open-paths';
+const OPEN_PATHS_RETRY_INTERVAL_MS = 100;
+const OPEN_PATHS_RETRY_TIMEOUT_MS = 15_000;
+
+/** Paths waiting for the workbench, in arrival order. */
+const pendingOpenPaths: string[] = [];
+const seenOpenPaths = new Set<string>();
+let openPathsRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let openPathsRetryStartedAt = 0;
+
 /**
  * Fade out the inline startup splash (index.html) and drop it from the DOM.
  * Idempotent: safe to call from the ready path, the failure path and the
@@ -64,6 +81,112 @@ function whenWorkbenchMounted(): Promise<void> {
 	});
 }
 
+/** Accept `{ paths: string[] }` (Tauri payload), a bare string[] or a single string. */
+function normalizeOpenPaths(payload: unknown): string[] {
+	let value: unknown = payload;
+	if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+		value = (value as { paths?: unknown }).paths;
+	}
+	if (typeof value === 'string') {
+		return value.length > 0 ? [value] : [];
+	}
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	return value.filter((path): path is string => typeof path === 'string' && path.length > 0);
+}
+
+/** Queue de-duplicated paths and try to hand them to the workbench. */
+function queueOpenPaths(payload: unknown): void {
+	const paths = normalizeOpenPaths(payload);
+	let queued = false;
+	for (const path of paths) {
+		if (!seenOpenPaths.has(path)) {
+			seenOpenPaths.add(path);
+			pendingOpenPaths.push(path);
+			queued = true;
+		}
+	}
+	if (queued && !deliverOpenPaths()) {
+		startOpenPathsDeliveryRetry();
+	}
+}
+
+/**
+ * Hand the queued paths to the workbench. Returns `true` when the queue was
+ * delivered (or is empty) and `false` while the workbench is not ready yet.
+ * Never throws: a failing handler must not break boot().
+ */
+function deliverOpenPaths(): boolean {
+	if (pendingOpenPaths.length === 0) {
+		return true;
+	}
+	const host = globalThis as {
+		__sidex_openPaths?: (paths: string[]) => unknown;
+		__sidex_editorService?: unknown;
+	};
+	// Both signals are published by web.main.ts once the workbench is created.
+	if (!document.querySelector('.monaco-workbench') || (!host.__sidex_openPaths && !host.__sidex_editorService)) {
+		return false;
+	}
+	const paths = pendingOpenPaths.slice();
+	try {
+		if (typeof host.__sidex_openPaths === 'function') {
+			Promise.resolve(host.__sidex_openPaths(paths)).catch(error =>
+				console.error('[SideX] Failed to open paths:', error)
+			);
+		} else {
+			window.dispatchEvent(new CustomEvent(OPEN_PATHS_DELIVERY_EVENT, { detail: { paths } }));
+		}
+	} catch (error) {
+		console.error('[SideX] Failed to deliver open paths:', error);
+		return false;
+	}
+	pendingOpenPaths.length = 0;
+	// The de-dupe set only guards the pending queue (startup drain + early event
+	// can report the same path); clearing it lets the same file be opened again
+	// later, e.g. from the OS after the user closed its tab.
+	seenOpenPaths.clear();
+	return true;
+}
+
+/** Poll (bounded) until the workbench can accept the queued paths. */
+function startOpenPathsDeliveryRetry(): void {
+	if (openPathsRetryTimer !== null) {
+		return;
+	}
+	openPathsRetryStartedAt = Date.now();
+	const retry = () => {
+		openPathsRetryTimer = null;
+		if (deliverOpenPaths()) {
+			return;
+		}
+		if (Date.now() - openPathsRetryStartedAt >= OPEN_PATHS_RETRY_TIMEOUT_MS) {
+			// Keep the queue: a later open-file event re-arms delivery.
+			console.warn('[SideX] Workbench not ready; ' + pendingOpenPaths.length + ' path(s) still queued');
+			return;
+		}
+		openPathsRetryTimer = setTimeout(retry, OPEN_PATHS_RETRY_INTERVAL_MS);
+	};
+	openPathsRetryTimer = setTimeout(retry, 0);
+}
+
+/**
+ * SideX: forward OS-opened files from the Rust side to the workbench.
+ * Registration is best-effort and dependency-free: `@tauri-apps/api` is already
+ * a dependency and is imported lazily so a plain browser build still boots.
+ */
+function setupOpenFileBridge(): void {
+	import('@tauri-apps/api/event')
+		.then(({ listen }) => listen(OPEN_FILE_EVENT, event => queueOpenPaths(event?.payload)))
+		.catch(error => console.warn('[SideX] Open-file event bridge unavailable:', error));
+
+	import('@tauri-apps/api/core')
+		.then(({ invoke }) => invoke(OPEN_PATHS_TAKE_COMMAND))
+		.then(paths => queueOpenPaths(paths))
+		.catch(error => console.warn('[SideX] "open_paths_take" unavailable:', error));
+}
+
 async function sidexOpenFolder() {
 	try {
 		const { open } = await import('@tauri-apps/plugin-dialog');
@@ -89,6 +212,10 @@ async function boot() {
 	// soon as possible and never let the splash outlive startup.
 	showNativeWindowAfterFirstPaint();
 	window.setTimeout(removeSplash, SPLASH_SAFETY_TIMEOUT_MS);
+
+	// SideX: start forwarding OS-opened paths as early as possible; delivery to
+	// the workbench is deferred until it is mounted and its services are ready.
+	setupOpenFileBridge();
 
 	// Load locale translations before any VS Code module imports
 	await loadNlsMessages();

@@ -615,7 +615,7 @@ export class SidexSettingsPanel extends Disposable {
 		}
 	}
 
-	private _renderSection(): void {
+	private async _renderSection(): Promise<void> {
 		for (const sec of this._sections) {
 			if (sec.dispose) {
 				try { sec.dispose(); } catch { /* ignore */ }
@@ -631,7 +631,7 @@ export class SidexSettingsPanel extends Disposable {
 		generalWrapper.id = 'section-general';
 		generalWrapper.className = 'sidex-settings-scroll-section';
 		this._content.appendChild(generalWrapper);
-		generalSec.render(generalWrapper);
+		const generalRender = generalSec.render(generalWrapper);
 
 		// 2. Plan & Usage
 		const planWrapper = document.createElement('div');
@@ -683,14 +683,12 @@ export class SidexSettingsPanel extends Disposable {
 		preferencesWrapper.id = 'section-preferences';
 		preferencesWrapper.className = 'sidex-settings-scroll-section';
 		this._content.appendChild(preferencesWrapper);
-		generalSec.renderPreferences(preferencesWrapper);
 
 		// 7. Notifications
 		const notificationsWrapper = document.createElement('div');
 		notificationsWrapper.id = 'section-notifications';
 		notificationsWrapper.className = 'sidex-settings-scroll-section';
 		this._content.appendChild(notificationsWrapper);
-		generalSec.renderNotifications(notificationsWrapper);
 
 		// 8. Indexing & Stats
 		const indexingWrapper = document.createElement('div');
@@ -706,6 +704,13 @@ export class SidexSettingsPanel extends Disposable {
 		privacyWrapper.id = 'section-privacy';
 		privacyWrapper.className = 'sidex-settings-scroll-section';
 		this._content.appendChild(privacyWrapper);
+
+		// These cards live in their own wrappers but share the GeneralSection
+		// instance, so they must wait for its settings read — otherwise they
+		// render the hardcoded defaults and never pick up persisted values.
+		await generalRender;
+		generalSec.renderPreferences(preferencesWrapper);
+		generalSec.renderNotifications(notificationsWrapper);
 		generalSec.renderPrivacy(privacyWrapper);
 
 		this._sections.push(generalSec);
@@ -715,7 +720,7 @@ export class SidexSettingsPanel extends Disposable {
 		if (this._isOpen) { return; }
 		this._isOpen = true;
 		this._renderAccount();
-		this._renderSection();
+		void this._renderSection();
 		this._overlay.style.display = '';
 	}
 

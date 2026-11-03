@@ -5,8 +5,13 @@
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { createCustomDropdown } from '../sidexSettingsStyles.js';
-
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
+import {
+	readSettingValue,
+	toSettingBoolean,
+	toSettingString,
+	writeSettingValue,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
 export class BetaSection implements SettingsSection {
 	private _container: HTMLElement | null = null;
@@ -50,13 +55,13 @@ export class BetaSection implements SettingsSection {
 		action.className = 'sidex-settings-row-action';
 		const dropdown = createCustomDropdown(['Default', 'Early Access'], 'Default', (newValue) => {
 			if (this._invoke) {
-				this._invoke('settings_update', { key: 'sidex.beta.updateChannel', value: JSON.stringify(newValue), scope: 'user' }).catch(() => {});
+				writeSettingValue(this._invoke, 'sidex.beta.updateChannel', newValue).catch(() => {});
 			}
 		});
 
 		if (this._invoke) {
-			this._invoke('settings_get', { section: 'sidex.beta.updateChannel' }).then((val) => {
-				if (val && typeof val === 'string') { (dropdown as any).setValue(val); }
+			readSettingValue(this._invoke, 'sidex.beta.updateChannel').then((val) => {
+				(dropdown as any).setValue(toSettingString(val, 'Default'));
 			}).catch(() => {});
 		}
 
@@ -92,10 +97,8 @@ export class BetaSection implements SettingsSection {
 		toggle.className = 'sidex-settings-toggle';
 
 		if (this._invoke) {
-			this._invoke('settings_get', { section: 'sidex.beta.rpcTracer' }).then((val) => {
-				if (val === true) {
-					toggle.classList.add('on');
-				}
+			readSettingValue(this._invoke, 'sidex.beta.rpcTracer').then((val) => {
+				toggle.classList.toggle('on', toSettingBoolean(val, false));
 			}).catch(() => {});
 		}
 
@@ -103,7 +106,7 @@ export class BetaSection implements SettingsSection {
 			toggle.classList.toggle('on');
 			if (this._invoke) {
 				const nowOn = toggle.classList.contains('on');
-				this._invoke('settings_update', { key: 'sidex.beta.rpcTracer', value: JSON.stringify(nowOn), scope: 'user' }).catch(() => {});
+				writeSettingValue(this._invoke, 'sidex.beta.rpcTracer', nowOn).catch(() => {});
 			}
 		});
 		action.appendChild(toggle);

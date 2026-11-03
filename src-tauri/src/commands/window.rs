@@ -105,6 +105,18 @@ pub struct WindowState {
 
 const WINDOW_STATE_KEY: &str = "sidex.windowState";
 
+/// Brings the running main window back to the foreground without restoring
+/// its saved position over the current one.
+pub fn focus_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 #[allow(clippy::cast_possible_wrap)]
 pub fn restore_and_show(app: &tauri::App, db: &StorageDb) {
     let Some(window) = app.get_webview_window("main") else {

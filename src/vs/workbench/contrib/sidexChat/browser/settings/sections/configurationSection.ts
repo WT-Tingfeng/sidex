@@ -6,12 +6,15 @@
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { createCustomDropdown } from '../sidexSettingsStyles.js';
-
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
-
-interface SettingsData {
-	[key: string]: unknown;
-}
+import {
+	readSettingsSection,
+	toSettingBoolean,
+	toSettingString,
+	toSettingStringArray,
+	writeSettingValue,
+	type SettingsSectionValues,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
 const DEFAULT_ORIGINS = [
 	'https://en.wikipedia.org',
@@ -31,10 +34,22 @@ const DEFAULT_ORIGINS = [
 	'https://deepwiki.org'
 ];
 
+const CASCADE_SECTION = 'sidex.cascade';
+const CASCADE_SETTING_KEYS = [
+	'background',
+	'autoOpenFiles',
+	'previews',
+	'gitignoreAccess',
+	'autoWebRequestsPolicy',
+	'allowedOrigins',
+	'allowList',
+	'denyList'
+];
+
 export class ConfigurationSection implements SettingsSection {
 	private _container: HTMLElement | null = null;
 	private _invoke: TauriInvoke;
-	private _settings: SettingsData = {};
+	private _settings: SettingsSectionValues = {};
 
 	private _origins: string[] = [...DEFAULT_ORIGINS];
 	private _allowList: string[] = [];
@@ -52,21 +67,23 @@ export class ConfigurationSection implements SettingsSection {
 		this._container = container;
 
 		if (this._invoke) {
-			try {
-				const data = await this._invoke('settings_get', { section: 'sidex.cascade' }) as SettingsData | null;
-				if (data) {
-					this._settings = data;
-					if (typeof data.allowedOrigins === 'string') {
-						this._origins = JSON.parse(data.allowedOrigins as string);
-					}
-					if (typeof data.allowList === 'string') {
-						this._allowList = JSON.parse(data.allowList as string);
-					}
-					if (typeof data.denyList === 'string') {
-						this._denyList = JSON.parse(data.denyList as string);
-					}
-				}
-			} catch { /* use defaults */ }
+			// Read the whole cascade section first; keys the backend did not
+			// return are read exactly, so this also works on older builds where
+			// section reads always came back empty.
+			this._settings = await readSettingsSection(this._invoke, CASCADE_SECTION, CASCADE_SETTING_KEYS);
+
+			// Legacy panels stored these lists via JSON.stringify(); new writes
+			// are plain arrays. Accept both, and only fall back to defaults when
+			// the setting has never been persisted.
+			if ('allowedOrigins' in this._settings) {
+				this._origins = toSettingStringArray(this._settings.allowedOrigins, DEFAULT_ORIGINS);
+			}
+			if ('allowList' in this._settings) {
+				this._allowList = toSettingStringArray(this._settings.allowList, []);
+			}
+			if ('denyList' in this._settings) {
+				this._denyList = toSettingStringArray(this._settings.denyList, []);
+			}
 		}
 
 		const title = document.createElement('div');
@@ -79,19 +96,19 @@ export class ConfigurationSection implements SettingsSection {
 
 		// 1. Allow Sidex in background
 		const bgRow = this._createRow(card1, 'Allow Sidex in background', 'Sidex keeps running when you switch conversations. Terminal commands may run in the background depending on your auto execution setting');
-		this._addToggle(bgRow, this._getSetting('background', true) as boolean, 'sidex.cascade.background');
+		this._addToggle(bgRow, this._getBoolean('background', true), 'sidex.cascade.background');
 
 		// 2. Auto-open edited files
 		const openFilesRow = this._createRow(card1, 'Auto-open edited files', 'Open files in the background if Sidex creates or edits them');
-		this._addToggle(openFilesRow, this._getSetting('autoOpenFiles', true) as boolean, 'sidex.cascade.autoOpenFiles');
+		this._addToggle(openFilesRow, this._getBoolean('autoOpenFiles', true), 'sidex.cascade.autoOpenFiles');
 
 		// 3. Sidex preview
 		const previewsRow = this._createRow(card1, 'Sidex preview', 'Sidex opens browser previews of dev servers it starts, integrating tightly with your workflow');
-		this._addToggle(previewsRow, this._getSetting('previews', true) as boolean, 'sidex.cascade.previews');
+		this._addToggle(previewsRow, this._getBoolean('previews', true), 'sidex.cascade.previews');
 
 		// 4. Gitignore access
 		const gitignoreRow = this._createRow(card1, 'Gitignore access', 'Let Sidex, tab, and supercomplete view and edit files in .gitignore');
-		this._addToggle(gitignoreRow, this._getSetting('gitignoreAccess', false) as boolean, 'sidex.cascade.gitignoreAccess');
+		this._addToggle(gitignoreRow, this._getBoolean('gitignoreAccess', false), 'sidex.cascade.gitignoreAccess');
 
 		container.appendChild(card1);
 
@@ -101,7 +118,7 @@ export class ConfigurationSection implements SettingsSection {
 
 		// 15. Auto web requests policy
 		const reqRow = this._createRow(card3, 'Auto web requests', 'Disabled (manual approval), Allowlist (only approved origins), Turbo (always fetch)');
-		this._addSelect(reqRow, ['Disabled', 'Allowlist', 'Turbo'], this._getSetting('autoWebRequestsPolicy', 'Allowlist') as string, 'sidex.cascade.autoWebRequestsPolicy');
+		this._addSelect(reqRow, ['Disabled', 'Allowlist', 'Turbo'], this._getText('autoWebRequestsPolicy', 'Allowlist'), 'sidex.cascade.autoWebRequestsPolicy');
 
 		// 15a. Allowed origins list box
 		this._originsContainer = document.createElement('div');
@@ -111,13 +128,18 @@ export class ConfigurationSection implements SettingsSection {
 		container.appendChild(card3);
 	}
 
-	private _getSetting(key: string, defaultValue: unknown): unknown {
-		return this._settings[key] ?? defaultValue;
+	private _getBoolean(key: string, defaultValue: boolean): boolean {
+		return toSettingBoolean(this._settings[key], defaultValue);
+	}
+
+	private _getText(key: string, defaultValue: string): string {
+		return toSettingString(this._settings[key], defaultValue);
 	}
 
 	private _saveLists(key: string, value: string[]): void {
 		if (this._invoke) {
-			this._invoke('settings_update', { key: `sidex.cascade.${key}`, value: JSON.stringify(value), scope: 'user' }).catch(() => {});
+			// Store a plain JSON array; legacy builds used JSON.stringify().
+			writeSettingValue(this._invoke, 'sidex.cascade.' + key, [...value]).catch(() => {});
 		}
 	}
 

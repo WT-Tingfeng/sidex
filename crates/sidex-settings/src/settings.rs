@@ -89,6 +89,40 @@ impl Settings {
             .or_else(|| Self::lookup(&self.default_layer, key))
     }
 
+    /// Get every setting stored under a dotted `prefix` as a JSON object.
+    ///
+    /// Keys are flat dotted strings (for example `sidex.cascade.background`),
+    /// so a plain [`Self::get_raw`] lookup of a section name like
+    /// `sidex.cascade` always misses. This collects all keys starting with
+    /// `prefix.` across the layers using the same precedence as
+    /// [`Self::get_raw`] (default < user < workspace) and strips `prefix.`
+    /// from the resulting keys.
+    ///
+    /// Legacy nested objects (for example
+    /// `{"sidex": {"cascade": {"background": false}}}`) are tolerated and
+    /// merged at the same layer; within a layer a flat dotted key wins over a
+    /// nested one with the same name.
+    ///
+    /// Returns [`Value::Null`] when no layer holds a matching key.
+    pub fn get_section(&self, prefix: &str) -> Value {
+        let prefix = prefix.trim_end_matches('.');
+        if prefix.is_empty() {
+            return Value::Null;
+        }
+
+        let mut merged = serde_json::Map::new();
+        // Lowest precedence first; later layers overwrite earlier ones.
+        for layer in [&self.default_layer, &self.user_layer, &self.workspace_layer] {
+            collect_section(layer, prefix, &mut merged);
+        }
+
+        if merged.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(merged)
+        }
+    }
+
     /// Get the entire user layer as a JSON value.
     pub fn user_layer(&self) -> &Value {
         &self.user_layer
@@ -176,6 +210,35 @@ fn set_in_layer(layer: &mut Value, key: &str, value: Value) {
     }
 }
 
+/// Collect the settings under `prefix` from one layer into `out`.
+///
+/// Handles both the canonical flat form (`"sidex.cascade.background": false`)
+/// and the legacy nested form (`{"sidex": {"cascade": {"background": false}}}`).
+fn collect_section(layer: &Value, prefix: &str, out: &mut serde_json::Map<String, Value>) {
+    // Legacy nested form; inserted first so that flat keys win within a layer.
+    let mut nested = Some(layer);
+    for segment in prefix.split('.') {
+        nested = nested.and_then(Value::as_object).and_then(|obj| obj.get(segment));
+    }
+    if let Some(inner) = nested.and_then(Value::as_object) {
+        for (key, value) in inner {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Canonical flat form.
+    if let Some(obj) = layer.as_object() {
+        let dotted = format!("{prefix}.");
+        for (key, value) in obj {
+            if let Some(rest) = key.strip_prefix(&dotted) {
+                if !rest.is_empty() {
+                    out.insert(rest.to_owned(), value.clone());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +314,57 @@ mod tests {
         let s = Settings::new();
         let theme: String = s.get("workbench.colorTheme").unwrap();
         assert_eq!(theme, "Default Dark+");
+    }
+
+    #[test]
+    fn get_section_strips_prefix() {
+        let mut s = Settings::new();
+        s.set("sidex.cascade.background", json!(false));
+        s.set("sidex.cascade.previews", json!(true));
+        s.set("sidex.general.telemetry", json!(true));
+        assert_eq!(
+            s.get_section("sidex.cascade"),
+            json!({"background": false, "previews": true})
+        );
+    }
+
+    #[test]
+    fn get_section_merges_layers_with_workspace_precedence() {
+        let mut s = Settings::new();
+        s.set("sidex.agents.maxTurns", json!(5));
+        s.set("sidex.agents.enabled", json!(true));
+        s.set_workspace("sidex.agents.maxTurns", json!(9));
+        let section = s.get_section("sidex.agents");
+        assert_eq!(section["maxTurns"], json!(9));
+        assert_eq!(section["enabled"], json!(true));
+    }
+
+    #[test]
+    fn get_section_missing_prefix_returns_null() {
+        let s = Settings::new();
+        assert_eq!(s.get_section("sidex.nonexistent"), Value::Null);
+        assert_eq!(s.get_section(""), Value::Null);
+    }
+
+    #[test]
+    fn get_section_tolerates_nested_legacy_objects() {
+        let mut s = Settings::new();
+        s.user_layer = json!({
+            "sidex": {"cascade": {"background": false, "previews": true}}
+        });
+        assert_eq!(
+            s.get_section("sidex.cascade"),
+            json!({"background": false, "previews": true})
+        );
+    }
+
+    #[test]
+    fn get_section_flat_key_wins_over_nested() {
+        let mut s = Settings::new();
+        s.user_layer = json!({
+            "sidex.general.telemetry": true,
+            "sidex": {"general": {"telemetry": false}}
+        });
+        assert_eq!(s.get_section("sidex.general")["telemetry"], json!(true));
     }
 }

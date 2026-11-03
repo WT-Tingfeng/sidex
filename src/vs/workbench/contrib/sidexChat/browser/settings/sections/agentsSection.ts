@@ -5,17 +5,42 @@
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { createCustomDropdown } from '../sidexSettingsStyles.js';
+import {
+	decodeSettingValue,
+	readSettingValue,
+	readSettingsSection,
+	toSettingBoolean,
+	toSettingNumber,
+	toSettingString,
+	writeSettingValue,
+	type SettingsSectionValues,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
-
-interface SettingsData {
-	[key: string]: unknown;
-}
+const AGENTS_SECTION = 'sidex.agents';
+const AGENTS_SETTING_KEYS = [
+	'textSize',
+	'submitWithCmdEnter',
+	'maxTabCount',
+	'maxTabCountMode',
+	'queueMessages',
+	'usageSummary',
+	'agentAutocomplete',
+	'autoApproveModeTransitions',
+	'exploreSubagentModel',
+	'startReviewOnCommit',
+	'includeSubmodules',
+	'includeUntracked',
+	'defaultApproach',
+	'commitAttribution',
+	'prAttribution',
+	'branchPrefix'
+];
 
 export class AgentsSection implements SettingsSection {
 	private _container: HTMLElement | null = null;
 	private _invoke: TauriInvoke;
-	private _settings: SettingsData = {};
+	private _settings: SettingsSectionValues = {};
 	/** User-supplied models (from ModelsSection) — there is no curated catalog to preset this from. */
 	private _modelOptions: string[] = [];
 
@@ -27,10 +52,9 @@ export class AgentsSection implements SettingsSection {
 		this._container = container;
 
 		if (this._invoke) {
-			try {
-				const data = await this._invoke('settings_get', { section: 'sidex.agents' }) as SettingsData | null;
-				if (data) { this._settings = data; }
-			} catch { /* use defaults */ }
+			// Section read first, exact per-key reads for anything the backend
+			// does not return (works with both backend shapes).
+			this._settings = await readSettingsSection(this._invoke, AGENTS_SECTION, AGENTS_SETTING_KEYS);
 			await this._loadModelOptions();
 		}
 
@@ -50,26 +74,26 @@ export class AgentsSection implements SettingsSection {
 		const card = this._createCard(container);
 
 		this._createDropdownRow(card, 'Text Size', 'Controls conversation text size', 'sidex.agents.textSize',
-			['Default', 'Small', 'Large'], this._getSetting('textSize', 'Default') as string);
+			['Default', 'Small', 'Large'], this._getText('textSize', 'Default'));
 
 		this._createToggleRow(card, 'Submit with Cmd+Enter', 'When enabled, Cmd+Enter submits and Enter inserts newline',
-			'sidex.agents.submitWithCmdEnter', this._getSetting('submitWithCmdEnter', false) as boolean);
+			'sidex.agents.submitWithCmdEnter', this._getBoolean('submitWithCmdEnter', false));
 
 		this._createNumberWithDropdownRow(card, 'Max Tab Count', 'Maximum number of concurrent tabs',
-			'sidex.agents.maxTabCount', this._getSetting('maxTabCount', 5) as number,
-			['Custom', 'Unlimited'], this._getSetting('maxTabCountMode', 'Custom') as string);
+			'sidex.agents.maxTabCount', this._getNumber('maxTabCount', 5),
+			['Custom', 'Unlimited'], this._getText('maxTabCountMode', 'Custom'));
 
 		this._createDropdownRow(card, 'Queue Messages', 'Behavior when sending messages while one is active', 'sidex.agents.queueMessages',
-			['Send after current message', 'Queue all', 'Ask each time'], this._getSetting('queueMessages', 'Send after current message') as string);
+			['Send after current message', 'Queue all', 'Ask each time'], this._getText('queueMessages', 'Send after current message'));
 
 		this._createDropdownRow(card, 'Usage Summary', 'When to show usage summary after responses', 'sidex.agents.usageSummary',
-			['Auto', 'Always', 'Never'], this._getSetting('usageSummary', 'Auto') as string);
+			['Auto', 'Always', 'Never'], this._getText('usageSummary', 'Auto'));
 
 		this._createToggleRow(card, 'Agent Autocomplete', 'Contextual suggestions while prompting',
-			'sidex.agents.agentAutocomplete', this._getSetting('agentAutocomplete', true) as boolean);
+			'sidex.agents.agentAutocomplete', this._getBoolean('agentAutocomplete', true));
 
 		this._createToggleRow(card, 'Auto-Approve Mode Transitions', 'Allow agent to switch modes without asking',
-			'sidex.agents.autoApproveModeTransitions', this._getSetting('autoApproveModeTransitions', false) as boolean);
+			'sidex.agents.autoApproveModeTransitions', this._getBoolean('autoApproveModeTransitions', false));
 	}
 
 	private _renderSubagents(container: HTMLElement): void {
@@ -109,7 +133,7 @@ export class AgentsSection implements SettingsSection {
 			});
 			action.appendChild(link);
 		} else {
-			const currentModel = this._getSetting('exploreSubagentModel', this._modelOptions[0]) as string;
+			const currentModel = this._getText('exploreSubagentModel', this._modelOptions[0]);
 			const dropdown = createCustomDropdown(this._modelOptions, currentModel, (newValue) => {
 				this._saveSetting('sidex.agents.exploreSubagentModel', newValue);
 			});
@@ -140,16 +164,16 @@ export class AgentsSection implements SettingsSection {
 		const card = this._createCard(container);
 
 		this._createToggleRow(card, 'Start Agent Review on Commit', 'Automatically start review when committing',
-			'sidex.agents.startReviewOnCommit', this._getSetting('startReviewOnCommit', false) as boolean);
+			'sidex.agents.startReviewOnCommit', this._getBoolean('startReviewOnCommit', false));
 
 		this._createToggleRow(card, 'Include Submodules in Agent Review', 'Include git submodule changes in review',
-			'sidex.agents.includeSubmodules', this._getSetting('includeSubmodules', true) as boolean);
+			'sidex.agents.includeSubmodules', this._getBoolean('includeSubmodules', true));
 
 		this._createToggleRow(card, 'Include Untracked Files in Agent Review', 'Include new untracked files in review',
-			'sidex.agents.includeUntracked', this._getSetting('includeUntracked', true) as boolean);
+			'sidex.agents.includeUntracked', this._getBoolean('includeUntracked', true));
 
 		this._createDropdownRow(card, 'Default Approach', 'How thorough agent review should be', 'sidex.agents.defaultApproach',
-			['Quick', 'Thorough'], this._getSetting('defaultApproach', 'Quick') as string);
+			['Quick', 'Thorough'], this._getText('defaultApproach', 'Quick'));
 	}
 
 	private _renderAttribution(container: HTMLElement): void {
@@ -162,10 +186,10 @@ export class AgentsSection implements SettingsSection {
 		const card = this._createCard(container);
 
 		this._createToggleRow(card, 'Commit Attribution', 'Mark commits as \'Made with SideX\'',
-			'sidex.agents.commitAttribution', this._getSetting('commitAttribution', true) as boolean);
+			'sidex.agents.commitAttribution', this._getBoolean('commitAttribution', true));
 
 		this._createToggleRow(card, 'PR Attribution', 'Mark pull requests as made with SideX',
-			'sidex.agents.prAttribution', this._getSetting('prAttribution', true) as boolean);
+			'sidex.agents.prAttribution', this._getBoolean('prAttribution', true));
 	}
 
 	private _renderGit(container: HTMLElement): void {
@@ -178,15 +202,15 @@ export class AgentsSection implements SettingsSection {
 		const card = this._createCard(container);
 
 		this._createInputRow(card, 'Branch Prefix', 'Prefix applied to branches created by the agent',
-			'sidex.agents.branchPrefix', this._getSetting('branchPrefix', '') as string, 'cursor/');
+			'sidex.agents.branchPrefix', this._getText('branchPrefix', ''), 'cursor/');
 	}
 
 	/** Mirrors ModelsSection's 'sidex.models.custom' — the only source of model ids now that there's no preset catalog. */
 	private async _loadModelOptions(): Promise<void> {
 		if (!this._invoke) { return; }
 		try {
-			const raw = await this._invoke('settings_get', { section: 'sidex.models.custom' });
-			const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+			const raw = await readSettingValue(this._invoke, 'sidex.models.custom');
+			const arr = decodeSettingValue(raw);
 			if (!Array.isArray(arr)) { return; }
 			this._modelOptions = arr
 				.map((entry: string | { id?: string }) => typeof entry === 'string' ? entry : entry?.id)
@@ -196,13 +220,22 @@ export class AgentsSection implements SettingsSection {
 
 	// --- Helpers ---
 
-	private _getSetting(key: string, defaultValue: unknown): unknown {
-		return this._settings[key] ?? defaultValue;
+	private _getBoolean(key: string, defaultValue: boolean): boolean {
+		return toSettingBoolean(this._settings[key], defaultValue);
+	}
+
+	private _getText(key: string, defaultValue: string): string {
+		return toSettingString(this._settings[key], defaultValue);
+	}
+
+	private _getNumber(key: string, defaultValue: number): number {
+		return toSettingNumber(this._settings[key], defaultValue);
 	}
 
 	private _saveSetting(key: string, value: unknown): void {
 		if (!this._invoke) { return; }
-		this._invoke('settings_update', { key, value: JSON.stringify(value), scope: 'user' }).catch(() => {});
+		// Plain JSON value; legacy builds stored JSON.stringify()-ed strings.
+		writeSettingValue(this._invoke, key, value).catch(() => {});
 	}
 
 	private _createCard(parent: HTMLElement): HTMLElement {

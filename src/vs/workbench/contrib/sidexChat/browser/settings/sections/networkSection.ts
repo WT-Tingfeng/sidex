@@ -6,8 +6,12 @@
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { createCustomDropdown } from '../sidexSettingsStyles.js';
 import { resolveServerEndpoint } from '../../localServer.js';
-
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
+import {
+	readSettingValue,
+	toSettingString,
+	writeSettingValue,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
 /** Subset of `providers_status`'s return shape (see `providers.rs`) that this section needs. */
 interface ProviderStatusInfo {
@@ -91,13 +95,13 @@ export class NetworkSection implements SettingsSection {
 		action.className = 'sidex-settings-row-action';
 		const dropdown = createCustomDropdown(['HTTP/2', 'HTTP/1.1'], 'HTTP/2', (newValue) => {
 			if (this._invoke) {
-				this._invoke('settings_update', { key: 'sidex.network.httpMode', value: JSON.stringify(newValue), scope: 'user' }).catch(() => {});
+				writeSettingValue(this._invoke, 'sidex.network.httpMode', newValue).catch(() => {});
 			}
 		});
 
 		if (this._invoke) {
-			this._invoke('settings_get', { section: 'sidex.network.httpMode' }).then((val) => {
-				if (val && typeof val === 'string') { (dropdown as any).setValue(val); }
+			readSettingValue(this._invoke, 'sidex.network.httpMode').then((val) => {
+				(dropdown as any).setValue(toSettingString(val, 'HTTP/2'));
 			}).catch(() => {});
 		}
 

@@ -808,7 +808,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
 				// Group 2: Editor Settings
 				actions.push(toAction({ id: 'sidex.manage.settings', label: t('Editor Settings'), run: () => this.commandService.executeCommand('workbench.action.openSettings') }));
 				actions.push(toAction({ id: 'sidex.manage.commandPalette', label: t('Command Palette...'), run: () => this.commandService.executeCommand('workbench.action.showCommands') }));
-				actions.push(toAction({ id: 'sidex.manage.keybindings', label: t('Open Keyboard Shortcuts [⌘K ⌘S]'), run: () => this.commandService.executeCommand('workbench.action.openGlobalKeybindings') }));
+				actions.push(toAction({ id: 'sidex.manage.keybindings', label: t(isMacintosh ? 'Open Keyboard Shortcuts [⌘K ⌘S]' : 'Open Keyboard Shortcuts [Ctrl+K Ctrl+S]'), run: () => this.commandService.executeCommand('workbench.action.openGlobalKeybindings') }));
 				actions.push(toAction({ id: 'sidex.manage.extensions', label: t('Extensions'), run: () => this.commandService.executeCommand('workbench.view.extensions') }));
 				actions.push(toAction({ id: 'sidex.manage.snippets', label: t('Configure Snippets'), run: () => this.commandService.executeCommand('workbench.action.openSnippets') }));
 				actions.push(toAction({ id: 'sidex.manage.tasks', label: t('Tasks'), run: () => this.commandService.executeCommand('workbench.action.tasks.runTask') }));

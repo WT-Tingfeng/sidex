@@ -5,8 +5,19 @@
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { createCustomDropdown } from '../sidexSettingsStyles.js';
+import {
+	readSettingsSection,
+	toSettingBoolean,
+	toSettingString,
+	writeSettingValue,
+	type SettingsSectionValues,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
+const TOOLS_SECTION = 'tools';
+const AUTO_RUN_MODES = ['Run Everything (Unsandboxed)', 'Ask for approval', 'Sandboxed'];
+const DEFAULT_AUTO_RUN_MODE = 'Run Everything (Unsandboxed)';
+const TOOL_SETTING_KEYS = ['webSearch', 'autoAcceptWebSearch', 'webFetch', 'autoRunMode'];
 
 export class ToolsSection implements SettingsSection {
 	private _container: HTMLElement | null = null;
@@ -19,16 +30,21 @@ export class ToolsSection implements SettingsSection {
 	async render(container: HTMLElement): Promise<void> {
 		this._container = container;
 
+		// Read the persisted values before building the rows: the toggles and the
+		// auto-run dropdown used to be hardcoded, so reopening the panel always
+		// showed the defaults instead of what the user had actually saved.
+		const values = await readSettingsSection(this._invoke, TOOLS_SECTION, TOOL_SETTING_KEYS);
+
 		const title = document.createElement('div');
 		title.className = 'sidex-settings-section-title';
 		title.textContent = 'Tools & MCPs';
 		container.appendChild(title);
 
-		this._renderContext(container);
-		this._renderAutoRun(container);
+		this._renderContext(container, values);
+		this._renderAutoRun(container, values);
 	}
 
-	private _renderContext(container: HTMLElement): void {
+	private _renderContext(container: HTMLElement, values: SettingsSectionValues): void {
 		const sectionTitle = this._sectionTitle('Context');
 		container.appendChild(sectionTitle);
 
@@ -36,18 +52,18 @@ export class ToolsSection implements SettingsSection {
 		card.className = 'sidex-settings-card';
 
 		const webSearchRow = this._createRow(card, 'Web Search Tool', '');
-		this._addToggle(webSearchRow, true, 'tools.webSearch');
+		this._addToggle(webSearchRow, toSettingBoolean(values.webSearch, true), 'tools.webSearch');
 
 		const autoWebRow = this._createRow(card, 'Auto-Accept Web Search', 'Enabled by Run Everything Auto-Run Mode');
-		this._addToggle(autoWebRow, true, 'tools.autoAcceptWebSearch');
+		this._addToggle(autoWebRow, toSettingBoolean(values.autoAcceptWebSearch, true), 'tools.autoAcceptWebSearch');
 
 		const webFetchRow = this._createRow(card, 'Web Fetch Tool', '');
-		this._addToggle(webFetchRow, true, 'tools.webFetch');
+		this._addToggle(webFetchRow, toSettingBoolean(values.webFetch, true), 'tools.webFetch');
 
 		container.appendChild(card);
 	}
 
-	private _renderAutoRun(container: HTMLElement): void {
+	private _renderAutoRun(container: HTMLElement, values: SettingsSectionValues): void {
 		const sectionTitle = this._sectionTitle('Auto-Run');
 		container.appendChild(sectionTitle);
 
@@ -55,7 +71,7 @@ export class ToolsSection implements SettingsSection {
 		card.className = 'sidex-settings-card';
 
 		const modeRow = this._createRow(card, 'Auto-Run Mode', '');
-		this._addSelect(modeRow, ['Run Everything (Unsandboxed)', 'Ask for approval', 'Sandboxed'], 'Run Everything (Unsandboxed)', 'tools.autoRunMode');
+		this._addSelect(modeRow, AUTO_RUN_MODES, toSettingString(values.autoRunMode, DEFAULT_AUTO_RUN_MODE), 'tools.autoRunMode');
 
 		container.appendChild(card);
 	}
@@ -101,10 +117,7 @@ export class ToolsSection implements SettingsSection {
 		toggle.className = 'sidex-settings-toggle' + (initialState ? ' on' : '');
 		toggle.addEventListener('click', () => {
 			toggle.classList.toggle('on');
-			const value = toggle.classList.contains('on');
-			if (this._invoke) {
-				this._invoke('settings_update', { key: settingKey, value, scope: 'user' }).catch(() => {});
-			}
+			this._persist(settingKey, toggle.classList.contains('on'));
 		});
 		row.querySelector('.sidex-settings-row-action')!.appendChild(toggle);
 		return toggle;
@@ -112,12 +125,17 @@ export class ToolsSection implements SettingsSection {
 
 	private _addSelect(row: HTMLElement, options: string[], defaultValue: string, settingKey: string): HTMLElement {
 		const dropdown = createCustomDropdown(options, defaultValue, (newValue) => {
-			if (this._invoke) {
-				this._invoke('settings_update', { key: settingKey, value: newValue, scope: 'user' }).catch(() => {});
-			}
+			this._persist(settingKey, newValue);
 		});
 		row.querySelector('.sidex-settings-row-action')!.appendChild(dropdown);
 		return dropdown;
+	}
+
+	private _persist(settingKey: string, value: unknown): void {
+		if (!this._invoke) {
+			return;
+		}
+		writeSettingValue(this._invoke, settingKey, value).catch(() => {});
 	}
 
 	dispose(): void {

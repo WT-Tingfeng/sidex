@@ -51,6 +51,15 @@
     "category": "DeveloperTool",
     "shortDescription": "A fast, open-source code editor.",
     "longDescription": "SideX is a fast, lightweight, open-source code editor built for developers.",
+    "fileAssociations": [
+      {
+        "ext": ["js", "mjs", "cjs", "ts", "tsx"],
+        "name": "SideX Code File",
+        "description": "JavaScript and TypeScript source file",
+        "mimeType": "text/plain",
+        "role": "Editor"
+      }
+    ],
     "resources": [
       "extension-host/*",
       "shell-integration/*"

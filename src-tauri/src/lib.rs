@@ -18,10 +18,13 @@ use commands::tasks::TaskProcessStore;
 use commands::terminal::TerminalStore;
 use commands::updater::UpdateManagerState;
 use commands::watch::WatchStore;
-use commands::window::restore_and_show;
-use std::sync::Arc;
+use commands::window::{focus_main_window, restore_and_show};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::Emitter;
 use tauri::Listener;
 use tauri::Manager;
 
@@ -430,6 +433,81 @@ fn fix_macos_path() {
     }
 }
 
+/// Paths handed to the app before the webview is able to open them.
+#[derive(Default)]
+pub struct PendingOpen(Mutex<Vec<PathBuf>>);
+
+impl PendingOpen {
+    fn push(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = self.0.lock() {
+            queue.extend(paths.iter().cloned());
+        }
+    }
+
+    fn take(&self) -> Vec<PathBuf> {
+        match self.0.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+}
+
+/// Resolves raw command-line arguments to existing files that can be opened.
+fn paths_from_args(argv: impl Iterator<Item = OsString>, cwd: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for arg in argv {
+        // Flags are not paths. OsString keeps non-Unicode file names intact.
+        if arg.to_string_lossy().starts_with('-') {
+            continue;
+        }
+        let path = PathBuf::from(arg);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        let Ok(canonical) = resolved.canonicalize() else {
+            continue;
+        };
+        if canonical.is_file() && !paths.contains(&canonical) {
+            paths.push(canonical);
+        }
+    }
+    paths
+}
+
+/// Buffers paths for the webview and notifies it that something was opened.
+fn open_paths(app: &tauri::AppHandle, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+
+    if let Some(pending) = app.try_state::<PendingOpen>() {
+        pending.push(paths);
+    }
+
+    let serialized: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let payload = serde_json::json!({ "paths": serialized });
+    let _ = app.emit("sidex://open-file", payload);
+}
+
+/// Returns the paths buffered before the webview started listening and clears
+/// the queue, so a second call reports nothing new.
+#[tauri::command]
+pub fn open_paths_take(state: tauri::State<'_, PendingOpen>) -> Vec<String> {
+    state
+        .take()
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[allow(clippy::too_many_lines)]
 pub fn run() {
@@ -449,8 +527,20 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        // Must be registered before the other plugins so a second instance is
+        // forwarded to this one instead of starting a new copy.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            let paths = paths_from_args(
+                argv.into_iter().skip(1).map(OsString::from),
+                Path::new(&cwd),
+            );
+            // Buffer before focusing: the webview may not be listening yet.
+            open_paths(app, &paths);
+            focus_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .manage(PendingOpen::default())
         .manage(AuthState::new())
         .manage(UpdateManagerState::new())
         .manage(Arc::new(commands::extensions::MarketplaceClientState::new()))
@@ -575,6 +665,14 @@ pub fn run() {
                         .map_err(|e| format!("failed to initialize storage database: {e}"))?
                 }
             };
+
+            // Paths from the command line (file association, "SideX file.js")
+            // are buffered until the webview asks for them.
+            {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let startup_paths = paths_from_args(std::env::args_os().skip(1), &cwd);
+                app.state::<PendingOpen>().push(&startup_paths);
+            }
 
             restore_and_show(app, &db);
 
@@ -772,6 +870,7 @@ pub fn run() {
             commands::set_window_title,
             commands::get_monitors,
             commands::save_window_state,
+            open_paths_take,
             commands::update_check,
             commands::update_download,
             commands::update_apply,
@@ -1054,6 +1153,20 @@ pub fn run() {
                 // database locked against the next launch.
                 if let Some(server) = app_handle.try_state::<Arc<server::LocalServer>>() {
                     server.shutdown();
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                if let tauri::RunEvent::Opened { urls } = &event {
+                    let paths: Vec<PathBuf> = urls
+                        .iter()
+                        .filter_map(|url| url.to_file_path().ok())
+                        .filter_map(|path| path.canonicalize().ok())
+                        .filter(|path| path.is_file())
+                        .collect();
+                    open_paths(app_handle, &paths);
+                    focus_main_window(app_handle);
                 }
             }
         });

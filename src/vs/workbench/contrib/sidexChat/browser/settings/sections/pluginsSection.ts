@@ -5,8 +5,13 @@
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
 import { createCustomDropdown } from '../sidexSettingsStyles.js';
-
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
+import {
+	readSettingValue,
+	toSettingBoolean,
+	toSettingString,
+	writeSettingValue,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
 interface McpServer {
 	name: string;
@@ -292,9 +297,8 @@ export class PluginsSection implements SettingsSection {
 		toggle.className = 'sidex-settings-toggle' + (initialState ? ' on' : '');
 
 		if (this._invoke) {
-			this._invoke('settings_get', { section: settingKey }).then((val) => {
-				if (val === true) { toggle.classList.add('on'); }
-				else if (val === false) { toggle.classList.remove('on'); }
+			readSettingValue(this._invoke, settingKey).then((val) => {
+				toggle.classList.toggle('on', toSettingBoolean(val, initialState));
 			}).catch(() => {});
 		}
 
@@ -302,7 +306,8 @@ export class PluginsSection implements SettingsSection {
 			toggle.classList.toggle('on');
 			const value = toggle.classList.contains('on');
 			if (this._invoke) {
-				this._invoke('settings_update', { key: settingKey, value: JSON.stringify(value), scope: 'user' }).catch(() => {});
+				// Plain JSON boolean; legacy builds stored 'true'/'false' strings.
+				writeSettingValue(this._invoke, settingKey, value).catch(() => {});
 			}
 		});
 		row.querySelector('.sidex-settings-row-action')!.appendChild(toggle);
@@ -312,13 +317,13 @@ export class PluginsSection implements SettingsSection {
 	private _addSelect(row: HTMLElement, options: string[], defaultValue: string, settingKey: string): HTMLElement {
 		const dropdown = createCustomDropdown(options, defaultValue, (newValue) => {
 			if (this._invoke) {
-				this._invoke('settings_update', { key: settingKey, value: JSON.stringify(newValue), scope: 'user' }).catch(() => {});
+				writeSettingValue(this._invoke, settingKey, newValue).catch(() => {});
 			}
 		});
 
 		if (this._invoke) {
-			this._invoke('settings_get', { section: settingKey }).then((val) => {
-				if (val && typeof val === 'string') { (dropdown as any).setValue(val); }
+			readSettingValue(this._invoke, settingKey).then((val) => {
+				(dropdown as any).setValue(toSettingString(val, defaultValue));
 			}).catch(() => {});
 		}
 

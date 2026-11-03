@@ -80,9 +80,15 @@ impl SettingsStore {
 
 /// Get settings.
 ///
-/// - `section`: if provided, returns only the value for that key
+/// - `section`: if provided, returns that setting. An exact stored key wins
+///   first (e.g. `editor.fontSize`, or a whole section stored as an object),
+///   so existing exact-key callers keep working. Otherwise the value is
+///   treated as a dotted section prefix (e.g. `sidex.cascade`): every stored
+///   `prefix.*` setting is returned as an object with the prefix stripped.
+///   Returns `null` when neither an exact key nor any prefixed key exists.
 /// - `scope`: one of `"user"`, `"workspace"`, or omitted/`"merged"` for the
-///   full merged object across all layers
+///   full merged object across all layers (only used when `section` is
+///   absent)
 #[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
 pub fn settings_get(
@@ -93,7 +99,15 @@ pub fn settings_get(
     let settings = state.inner.read().map_err(|e| e.to_string())?;
 
     if let Some(key) = section {
-        return Ok(settings.get_raw(&key).cloned().unwrap_or(Value::Null));
+        // Backward compatibility: exact keys (and whole-section objects stored
+        // under a full section name) are returned verbatim.
+        if let Some(exact) = settings.get_raw(&key) {
+            return Ok(exact.clone());
+        }
+        // Settings are stored as flat dotted keys ("sidex.cascade.background"),
+        // while panels ask for the section name ("sidex.cascade"); merge the
+        // prefixed keys so panels read their real values instead of defaults.
+        return Ok(settings.get_section(&key));
     }
 
     match scope.as_deref() {

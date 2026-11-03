@@ -4,8 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { SettingsSection } from '../sidexSettingsPanel.js';
-
-type TauriInvoke = ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null;
+import {
+	readSettingValue,
+	toSettingBoolean,
+	writeSettingValue,
+	type TauriInvoke
+} from '../settingsReadback.js';
 
 interface RuleItem {
 	id: string;
@@ -368,9 +372,8 @@ export class RulesSection implements SettingsSection {
 		toggle.className = 'sidex-settings-toggle' + (initialState ? ' on' : '');
 
 		if (this._invoke) {
-			this._invoke('settings_get', { section: settingKey }).then((val) => {
-				if (val === true) { toggle.classList.add('on'); }
-				else if (val === false) { toggle.classList.remove('on'); }
+			readSettingValue(this._invoke, settingKey).then((val) => {
+				toggle.classList.toggle('on', toSettingBoolean(val, initialState));
 			}).catch(() => {});
 		}
 
@@ -378,7 +381,8 @@ export class RulesSection implements SettingsSection {
 			toggle.classList.toggle('on');
 			const value = toggle.classList.contains('on');
 			if (this._invoke) {
-				this._invoke('settings_update', { key: settingKey, value: JSON.stringify(value), scope: 'user' }).catch(() => {});
+				// Plain JSON boolean; legacy builds stored 'true'/'false' strings.
+				writeSettingValue(this._invoke, settingKey, value).catch(() => {});
 			}
 		});
 		row.querySelector('.sidex-settings-row-action')!.appendChild(toggle);

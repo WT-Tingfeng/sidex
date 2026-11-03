@@ -14,6 +14,7 @@ import { ResourceTree } from '../../../../base/common/resourceTree.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
 import { basename, relativePath } from '../../../../base/common/resources.js';
 import { Schemas } from '../../../../base/common/network.js';
+import { isMacintosh } from '../../../../base/common/platform.js';
 import { MarkdownString } from '../../../../base/common/htmlContent.js';
 import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../common/contributions.js';
 import type { IWorkbenchContribution } from '../../../common/contributions.js';
@@ -65,6 +66,7 @@ import {
 } from '../../../services/decorations/common/decorations.js';
 import { registerColor } from '../../../../platform/theme/common/colorRegistry.js';
 import { historyItemRefColor, historyItemRemoteRefColor } from './scmHistory.js';
+import { t } from '../../sidexChat/browser/i18n.js';
 
 // ─── Tauri invoke() bridge ──────────────────────────────────────────────────
 
@@ -1136,8 +1138,10 @@ class TauriGitContribution extends Disposable implements IWorkbenchContribution 
 		this._register(repository);
 		this._register(provider);
 
-		// Set the commit message placeholder
-		repository.input.placeholder = `Message (⌘Enter to commit on "${provider.name}")`;
+		// Set the commit message placeholder. The ⌘ glyph is missing from many
+		// Windows/Linux fonts and renders as a tofu box, so use the platform modifier.
+		const commitShortcut = isMacintosh ? '⌘Enter' : 'Ctrl+Enter';
+		repository.input.placeholder = t(`Message (${commitShortcut} to commit on "${provider.name}")`);
 
 		this._registerDiffCommands(provider, rootPath);
 		this._registerCommitCommand(provider, rootPath);
